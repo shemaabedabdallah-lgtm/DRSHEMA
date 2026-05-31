@@ -9,37 +9,10 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 WATERMARK_TEXT = "DR SHEMA"
-PIPER_MODEL_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx"
-PIPER_CONFIG_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json"
-PIPER_DIR = "/tmp/piper"
-PIPER_MODEL = "/tmp/piper/voice.onnx"
-PIPER_CONFIG = "/tmp/piper/voice.onnx.json"
-PIPER_BIN = "/tmp/piper/piper"
-PIPER_READY = False
-
-def setup_piper():
-    global PIPER_READY
-    if PIPER_READY:
-        return True
-    try:
-        os.makedirs(PIPER_DIR, exist_ok=True)
-        if not os.path.exists(PIPER_BIN):
-            piper_tar = "/tmp/piper.tar.gz"
-            subprocess.run(["wget", "-q", "-O", piper_tar, "https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz"], check=True, timeout=120)
-            subprocess.run(["tar", "-xzf", piper_tar, "-C", "/tmp/"], check=True)
-            subprocess.run(["chmod", "+x", PIPER_BIN], check=True)
-        if not os.path.exists(PIPER_MODEL):
-            subprocess.run(["wget", "-q", "-O", PIPER_MODEL, PIPER_MODEL_URL], check=True, timeout=120)
-            subprocess.run(["wget", "-q", "-O", PIPER_CONFIG, PIPER_CONFIG_URL], check=True, timeout=60)
-        PIPER_READY = True
-        return True
-    except Exception as e:
-        print(f"Piper setup failed: {e}")
-        return False
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "DR SHEMA Video Builder", "tts": "piper"})
+    return jsonify({"status": "ok", "service": "DR SHEMA Video Builder"})
 
 @app.route("/build", methods=["POST"])
 def build_video():
@@ -51,41 +24,39 @@ def build_video():
 
     work_dir = tempfile.mkdtemp()
     try:
+        # Voice with flite
         audio_path = os.path.join(work_dir, "voice.wav")
-        piper_ok = setup_piper()
-        if piper_ok:
-            try:
-                subprocess.run(
-                    [PIPER_BIN, "--model", PIPER_MODEL, "--output_file", audio_path],
-                    input=script[:400].encode(),
-                    check=True, capture_output=True, timeout=60
-                )
-            except:
-                subprocess.run(["flite", "-t", script[:300], "-o", audio_path], check=True, capture_output=True, timeout=30)
-        else:
-            subprocess.run(["flite", "-t", script[:300], "-o", audio_path], check=True, capture_output=True, timeout=30)
+        subprocess.run(
+            ["flite", "-t", script[:300], "-o", audio_path],
+            check=True, capture_output=True, timeout=30
+        )
 
+        # Download ONE clip
         clip_path = os.path.join(work_dir, "clip.mp4")
         if not clip_urls:
-            return jsonify({"success": False, "error": "No clip URL provided"}), 400
+            return jsonify({"success": False, "error": "No clip URL"}), 400
         r = requests.get(clip_urls[0], timeout=30, stream=True)
         with open(clip_path, "wb") as f:
             for chunk in r.iter_content(chunk_size=524288):
                 f.write(chunk)
 
+        # FFmpeg - very compressed output for small file size
         output_path = os.path.join(work_dir, "output.mp4")
-        safe_title = title.replace("'", "").replace(":", "-")[:50]
+        safe_title = title.replace("'", "").replace(":", "-")[:40]
         filters = (
-            f"drawtext=text='{WATERMARK_TEXT}':fontsize=32:fontcolor=white@0.7"
-            f":x=20:y=20:shadowcolor=black:shadowx=2:shadowy=2,"
-            f"drawtext=text='{safe_title}':fontsize=24:fontcolor=yellow"
-            f":x=(w-text_w)/2:y=h-60:box=1:boxcolor=black@0.5:boxborderw=6"
+            f"scale=640:360,"
+            f"drawtext=text='{WATERMARK_TEXT}':fontsize=20:fontcolor=white@0.7:x=10:y=10:shadowcolor=black:shadowx=1:shadowy=1,"
+            f"drawtext=text='{safe_title}':fontsize=16:fontcolor=yellow:x=(w-text_w)/2:y=h-40:box=1:boxcolor=black@0.5:boxborderw=4"
         )
         subprocess.run([
-            "ffmpeg", "-y", "-i", clip_path, "-i", audio_path,
-            "-vf", filters, "-map", "0:v:0", "-map", "1:a:0",
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-            "-c:a", "aac", "-b:a", "64k", "-shortest", "-t", "60",
+            "ffmpeg", "-y",
+            "-i", clip_path, "-i", audio_path,
+            "-vf", filters,
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "35",
+            "-vb", "300k",
+            "-c:a", "aac", "-b:a", "48k",
+            "-shortest", "-t", "45",
             output_path
         ], check=True, capture_output=True, timeout=120)
 
@@ -93,6 +64,7 @@ def build_video():
             video_b64 = base64.b64encode(f.read()).decode()
 
         return jsonify({"success": True, "video": video_b64, "title": title})
+
     except Exception as e:
         return jsonify({"success": False, "error": str(e)[:200]}), 500
     finally:
