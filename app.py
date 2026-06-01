@@ -10,9 +10,57 @@ app = Flask(__name__)
 
 WATERMARK_TEXT = "DR SHEMA"
 
+def generate_voice(script, audio_path):
+    """Try multiple TTS methods"""
+    short = script[:300]
+    
+    # Try espeak (usually available)
+    try:
+        subprocess.run(
+            ["espeak", "-w", audio_path, "-s", "150", "-p", "40", short],
+            check=True, capture_output=True, timeout=30
+        )
+        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
+            return True
+    except:
+        pass
+    
+    # Try espeak-ng
+    try:
+        subprocess.run(
+            ["espeak-ng", "-w", audio_path, "-s", "150", short],
+            check=True, capture_output=True, timeout=30
+        )
+        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
+            return True
+    except:
+        pass
+    
+    # Try flite
+    try:
+        subprocess.run(
+            ["flite", "-t", short, "-o", audio_path],
+            check=True, capture_output=True, timeout=30
+        )
+        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
+            return True
+    except:
+        pass
+    
+    return False
+
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "DR SHEMA Video Builder"})
+    # Check what TTS is available
+    tts = "none"
+    for cmd in ["espeak", "espeak-ng", "flite"]:
+        try:
+            subprocess.run([cmd, "--version"], capture_output=True, timeout=5)
+            tts = cmd
+            break
+        except:
+            pass
+    return jsonify({"status": "ok", "service": "DR SHEMA Video Builder", "tts": tts})
 
 @app.route("/build", methods=["POST"])
 def build_video():
@@ -24,23 +72,18 @@ def build_video():
 
     work_dir = tempfile.mkdtemp()
     try:
-        # Voice with flite
         audio_path = os.path.join(work_dir, "voice.wav")
-        subprocess.run(
-            ["flite", "-t", script[:300], "-o", audio_path],
-            check=True, capture_output=True, timeout=30
-        )
+        has_audio = generate_voice(script, audio_path)
 
-        # Download ONE clip
         clip_path = os.path.join(work_dir, "clip.mp4")
         if not clip_urls:
             return jsonify({"success": False, "error": "No clip URL"}), 400
+        
         r = requests.get(clip_urls[0], timeout=30, stream=True)
         with open(clip_path, "wb") as f:
             for chunk in r.iter_content(chunk_size=524288):
                 f.write(chunk)
 
-        # FFmpeg - very compressed output for small file size
         output_path = os.path.join(work_dir, "output.mp4")
         safe_title = title.replace("'", "").replace(":", "-")[:40]
         filters = (
@@ -48,17 +91,28 @@ def build_video():
             f"drawtext=text='{WATERMARK_TEXT}':fontsize=20:fontcolor=white@0.7:x=10:y=10:shadowcolor=black:shadowx=1:shadowy=1,"
             f"drawtext=text='{safe_title}':fontsize=16:fontcolor=yellow:x=(w-text_w)/2:y=h-40:box=1:boxcolor=black@0.5:boxborderw=4"
         )
-        subprocess.run([
-            "ffmpeg", "-y",
-            "-i", clip_path, "-i", audio_path,
-            "-vf", filters,
-            "-map", "0:v:0", "-map", "1:a:0",
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "35",
-            "-vb", "300k",
-            "-c:a", "aac", "-b:a", "48k",
-            "-shortest", "-t", "45",
-            output_path
-        ], check=True, capture_output=True, timeout=120)
+
+        if has_audio:
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", clip_path, "-i", audio_path,
+                "-vf", filters,
+                "-map", "0:v:0", "-map", "1:a:0",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "35",
+                "-vb", "300k", "-c:a", "aac", "-b:a", "48k",
+                "-shortest", "-t", "45", output_path
+            ]
+        else:
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", clip_path,
+                "-vf", filters,
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "35",
+                "-vb", "300k", "-an",
+                "-t", "45", output_path
+            ]
+
+        subprocess.run(cmd, check=True, capture_output=True, timeout=120)
 
         with open(output_path, "rb") as f:
             video_b64 = base64.b64encode(f.read()).decode()
