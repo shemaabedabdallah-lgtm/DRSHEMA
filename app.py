@@ -10,11 +10,11 @@ app = Flask(__name__)
 WATERMARK_TEXT = "DR SHEMA"
 
 def generate_voice(script, audio_path):
-    for voice, args in [
-        ("espeak-male", ["espeak", "-v", "en+m3", "-s", "145", "-p", "35", "-a", "180", "-w", audio_path, script[:1500]]),
-        ("espeak-ng-male", ["espeak-ng", "-v", "en-us+m3", "-s", "145", "-p", "35", "-w", audio_path, script[:1500]]),
-        ("flite-rms", ["flite", "-voice", "rms", "-t", script[:1000], "-o", audio_path]),
-        ("flite", ["flite", "-t", script[:800], "-o", audio_path]),
+    for args in [
+        ["espeak", "-v", "en+m3", "-s", "145", "-p", "35", "-a", "180", "-w", audio_path, script[:1500]],
+        ["espeak-ng", "-v", "en-us+m3", "-s", "145", "-p", "35", "-w", audio_path, script[:1500]],
+        ["flite", "-voice", "rms", "-t", script[:1000], "-o", audio_path],
+        ["flite", "-t", script[:800], "-o", audio_path],
     ]:
         try:
             subprocess.run(args, check=True, capture_output=True, timeout=90)
@@ -38,11 +38,9 @@ def build_video():
 
     work_dir = tempfile.mkdtemp()
     try:
-        # Generate male voice
         audio_path = os.path.join(work_dir, "voice.wav")
         has_audio = generate_voice(script, audio_path)
 
-        # Download clips
         clip_paths = []
         for i, url in enumerate(clip_urls[:3]):
             try:
@@ -58,7 +56,6 @@ def build_video():
         if not clip_paths:
             return jsonify({"success": False, "error": "No clips"}), 400
 
-        # Concatenate clips
         if len(clip_paths) > 1:
             concat_list = os.path.join(work_dir, "concat.txt")
             with open(concat_list, "w") as f:
@@ -70,13 +67,12 @@ def build_video():
         else:
             main_clip = clip_paths[0]
 
-        # Build video - optimized for small file size but long duration
         output_path = os.path.join(work_dir, "output.mp4")
         safe_title = title.replace("'", "").replace(":", "-")[:50]
         filters = (
-            f"scale=854:480,"  # 480p to keep file small
-            f"drawtext=text='{WATERMARK_TEXT}':fontsize=28:fontcolor=white@0.8:x=10:y=10:shadowcolor=black:shadowx=2:shadowy=2,"
-            f"drawtext=text='{safe_title}':fontsize=22:fontcolor=yellow:x=(w-text_w)/2:y=h-50:box=1:boxcolor=black@0.5:boxborderw=6"
+            f"scale=640:360,"
+            f"drawtext=text='{WATERMARK_TEXT}':fontsize=24:fontcolor=white@0.8:x=10:y=10:shadowcolor=black:shadowx=2:shadowy=2,"
+            f"drawtext=text='{safe_title}':fontsize=18:fontcolor=yellow:x=(w-text_w)/2:y=h-40:box=1:boxcolor=black@0.5:boxborderw=5"
         )
 
         if has_audio:
@@ -87,11 +83,11 @@ def build_video():
                 "-i", audio_path,
                 "-vf", filters,
                 "-map", "0:v:0", "-map", "1:a:0",
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "32",
-                "-vb", "500k",
-                "-c:a", "aac", "-b:a", "96k",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "38",
+                "-vb", "200k",
+                "-c:a", "aac", "-b:a", "64k",
                 "-shortest",
-                "-t", "480",  # max 8 minutes
+                "-t", "600",
                 output_path
             ]
         else:
@@ -99,13 +95,13 @@ def build_video():
                 "ffmpeg", "-y",
                 "-i", main_clip,
                 "-vf", filters,
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "32",
-                "-vb", "500k", "-an",
-                "-t", "480",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "38",
+                "-vb", "200k", "-an",
+                "-t", "600",
                 output_path
             ]
 
-        subprocess.run(cmd, check=True, capture_output=True, timeout=480)
+        subprocess.run(cmd, check=True, capture_output=True, timeout=600)
 
         with open(output_path, "rb") as f:
             video_b64 = base64.b64encode(f.read()).decode()
