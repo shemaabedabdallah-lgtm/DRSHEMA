@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: DRSHEMA
+    runtime: python
+    buildCommand: pip install flask requests gunicorn && apt-get update && apt-get install -y ffmpeg flite
+    startCommand: gunicorn app:app --timeout 600 --workers 1
+    plan: starter
