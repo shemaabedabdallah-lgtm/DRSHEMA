@@ -11,26 +11,69 @@ app = Flask(__name__)
 WATERMARK_TEXT = "DR SHEMA"
 
 def generate_voice(script, audio_path):
-    for cmd, args in [
-        ("espeak", ["espeak", "-w", audio_path, "-s", "145", "-p", "40"]),
-        ("espeak-ng", ["espeak-ng", "-w", audio_path, "-s", "145"]),
-        ("flite", ["flite", "-t", script[:500], "-o", audio_path]),
-    ]:
-        try:
-            if cmd == "flite":
-                subprocess.run(args, check=True, capture_output=True, timeout=60)
-            else:
-                p = subprocess.Popen(args, stdin=subprocess.PIPE, capture_output=True)
-                p.communicate(input=script[:800].encode(), timeout=60)
-            if os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
-                return True
-        except:
-            continue
+    """Generate male voice audio"""
+    # Try espeak with male voice settings
+    try:
+        result = subprocess.run(
+            ["espeak", 
+             "-v", "en+m3",  # male voice 3
+             "-s", "140",    # speed
+             "-p", "35",     # pitch (lower = deeper/male)
+             "-a", "180",    # amplitude
+             "-w", audio_path,
+             script[:1000]],
+            check=True, capture_output=True, timeout=60
+        )
+        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
+            return True
+    except:
+        pass
+
+    # Try espeak-ng with male voice
+    try:
+        subprocess.run(
+            ["espeak-ng",
+             "-v", "en-us+m3",
+             "-s", "140",
+             "-p", "35",
+             "-w", audio_path,
+             script[:1000]],
+            check=True, capture_output=True, timeout=60
+        )
+        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
+            return True
+    except:
+        pass
+
+    # Try flite with male voice
+    try:
+        subprocess.run(
+            ["flite", "-voice", "rms",  # rms is male voice in flite
+             "-t", script[:800],
+             "-o", audio_path],
+            check=True, capture_output=True, timeout=60
+        )
+        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
+            return True
+    except:
+        pass
+
+    # Fallback flite default
+    try:
+        subprocess.run(
+            ["flite", "-t", script[:800], "-o", audio_path],
+            check=True, capture_output=True, timeout=60
+        )
+        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
+            return True
+    except:
+        pass
+
     return False
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "DR SHEMA Video Builder", "ram": "2GB"})
+    return jsonify({"status": "ok", "service": "DR SHEMA Video Builder", "voice": "male", "ram": "2GB"})
 
 @app.route("/build", methods=["POST"])
 def build_video():
@@ -42,11 +85,11 @@ def build_video():
 
     work_dir = tempfile.mkdtemp()
     try:
-        # Generate voice
+        # Generate MALE voice
         audio_path = os.path.join(work_dir, "voice.wav")
         has_audio = generate_voice(script, audio_path)
 
-        # Download clips (up to 3)
+        # Download all 3 clips
         clip_paths = []
         for i, url in enumerate(clip_urls[:3]):
             try:
@@ -62,7 +105,7 @@ def build_video():
         if not clip_paths:
             return jsonify({"success": False, "error": "No clips downloaded"}), 400
 
-        # Concatenate clips if multiple
+        # Concatenate clips
         if len(clip_paths) > 1:
             concat_list = os.path.join(work_dir, "concat.txt")
             with open(concat_list, "w") as f:
@@ -72,12 +115,12 @@ def build_video():
             subprocess.run([
                 "ffmpeg", "-y", "-f", "concat", "-safe", "0",
                 "-i", concat_list, "-c", "copy", concat_path
-            ], check=True, capture_output=True, timeout=60)
+            ], check=True, capture_output=True, timeout=120)
             main_clip = concat_path
         else:
             main_clip = clip_paths[0]
 
-        # Build final video
+        # Build final HD video - up to 5 minutes
         output_path = os.path.join(work_dir, "output.mp4")
         safe_title = title.replace("'", "").replace(":", "-")[:50]
         filters = (
@@ -91,12 +134,15 @@ def build_video():
         if has_audio:
             cmd = [
                 "ffmpeg", "-y",
-                "-i", main_clip, "-i", audio_path,
+                "-stream_loop", "-1",  # loop video if shorter than audio
+                "-i", main_clip,
+                "-i", audio_path,
                 "-vf", filters,
                 "-map", "0:v:0", "-map", "1:a:0",
-                "-c:v", "libx264", "-preset", "fast", "-crf", "28",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "26",
                 "-c:a", "aac", "-b:a", "128k",
-                "-shortest", "-t", "300",  # up to 5 minutes
+                "-shortest",
+                "-t", "300",  # max 5 minutes
                 output_path
             ]
         else:
@@ -104,7 +150,7 @@ def build_video():
                 "ffmpeg", "-y",
                 "-i", main_clip,
                 "-vf", filters,
-                "-c:v", "libx264", "-preset", "fast", "-crf", "28",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "26",
                 "-an", "-t", "300",
                 output_path
             ]
