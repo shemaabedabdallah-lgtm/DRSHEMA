@@ -1,17 +1,24 @@
 FROM python:3.11-slim
 
+# Install ffmpeg and ffprobe
 RUN apt-get update && apt-get install -y \
     ffmpeg \
-    espeak \
-    espeak-ng \
-    libespeak1 \
     && rm -rf /var/lib/apt/lists/*
 
+# Set working directory
 WORKDIR /app
+
+# Copy requirements first for caching
 COPY requirements.txt .
+
+# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py .
-COPY logo.png* ./
+# Copy app files
+COPY . .
 
-CMD gunicorn app:app --timeout 600 --workers 1 --bind 0.0.0.0:$PORT
+# Expose port
+EXPOSE 5000
+
+# Run the app
+CMD ["python", "app.py"]
