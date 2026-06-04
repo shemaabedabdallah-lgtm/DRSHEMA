@@ -10,22 +10,21 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 WATERMARK_TEXT = "DR SHEMA"
 
-async def edge_tts_generate(text, output_path):
-    """Use Microsoft Edge TTS - free, no system packages needed"""
-    import edge_tts
-    communicate = edge_tts.Communicate(text, "en-US-GuyNeural")
-    await communicate.save(output_path)
-
 def generate_voice(script, audio_path):
-    work_dir = os.path.dirname(audio_path)
+    """Try edge-tts first, then espeak"""
     
-    # Method 1: edge-tts (Microsoft, free, online, male voice)
+    # Method 1: edge-tts (Microsoft, natural voice)
     try:
         import edge_tts
-        mp3_path = os.path.join(work_dir, "voice.mp3")
-        asyncio.run(edge_tts_generate(script[:5000], mp3_path))
+        mp3_path = audio_path.replace('.wav', '.mp3')
+        
+        async def do_tts():
+            communicate = edge_tts.Communicate(script[:8000], "en-US-GuyNeural")
+            await communicate.save(mp3_path)
+        
+        asyncio.run(do_tts())
+        
         if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 1000:
-            # Convert mp3 to wav
             subprocess.run(["ffmpeg", "-y", "-i", mp3_path, audio_path],
                          check=True, capture_output=True, timeout=30)
             if os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000:
@@ -34,54 +33,48 @@ def generate_voice(script, audio_path):
     except Exception as e:
         print(f"edge-tts failed: {e}")
 
-    # Method 2: gTTS (Google, free, online)
+    # Method 2: espeak (system installed via Docker)
     try:
-        from gtts import gTTS
-        chunks = [script[i:i+3000] for i in range(0, min(len(script), 9000), 3000)]
-        mp3_files = []
-        for i, chunk in enumerate(chunks):
-            mp3 = os.path.join(work_dir, f"g{i}.mp3")
-            gTTS(text=chunk, lang='en').save(mp3)
-            mp3_files.append(mp3)
-        
-        if len(mp3_files) == 1:
-            subprocess.run(["ffmpeg", "-y", "-i", mp3_files[0], audio_path],
-                         check=True, capture_output=True, timeout=30)
-        else:
-            lst = os.path.join(work_dir, "gl.txt")
-            with open(lst, "w") as f:
-                for m in mp3_files:
-                    f.write(f"file '{m}'\n")
-            combined = os.path.join(work_dir, "gc.mp3")
-            subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0",
-                          "-i", lst, "-c", "copy", combined],
-                         check=True, capture_output=True, timeout=60)
-            subprocess.run(["ffmpeg", "-y", "-i", combined, audio_path],
-                         check=True, capture_output=True, timeout=30)
-        
+        subprocess.run(
+            ["espeak", "-v", "en+m3", "-s", "145", "-p", "35", "-w", audio_path, script[:8000]],
+            check=True, capture_output=True, timeout=120
+        )
         if os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000:
-            print(f"gTTS SUCCESS: {os.path.getsize(audio_path)} bytes")
+            print(f"espeak SUCCESS: {os.path.getsize(audio_path)} bytes")
             return True
     except Exception as e:
-        print(f"gTTS failed: {e}")
+        print(f"espeak failed: {e}")
 
-    print("All TTS methods failed")
+    # Method 3: espeak-ng
+    try:
+        subprocess.run(
+            ["espeak-ng", "-v", "en-us+m3", "-s", "145", "-p", "35", "-w", audio_path, script[:8000]],
+            check=True, capture_output=True, timeout=120
+        )
+        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000:
+            print(f"espeak-ng SUCCESS: {os.path.getsize(audio_path)} bytes")
+            return True
+    except Exception as e:
+        print(f"espeak-ng failed: {e}")
+
+    print("All TTS failed")
     return False
 
 @app.route("/health", methods=["GET"])
 def health():
-    available = []
+    tts = []
     try:
         import edge_tts
-        available.append("edge-tts")
+        tts.append("edge-tts")
     except:
         pass
-    try:
-        from gtts import gTTS
-        available.append("gtts")
-    except:
-        pass
-    return jsonify({"status": "ok", "tts": available})
+    for cmd in ["espeak", "espeak-ng", "flite"]:
+        try:
+            subprocess.run([cmd, "--version"], capture_output=True, timeout=5)
+            tts.append(cmd)
+        except:
+            pass
+    return jsonify({"status": "ok", "service": "DR SHEMA Docker", "tts": tts})
 
 @app.route("/build", methods=["POST"])
 def build_video():
@@ -93,10 +86,11 @@ def build_video():
 
     work_dir = tempfile.mkdtemp()
     try:
+        # Generate voice
         audio_path = os.path.join(work_dir, "voice.wav")
         has_audio = generate_voice(script, audio_path)
-        print(f"Voice: {has_audio}, size: {os.path.getsize(audio_path) if has_audio else 0}")
 
+        # Download clips
         clip_paths = []
         for i, url in enumerate(clip_urls[:3]):
             try:
@@ -113,6 +107,7 @@ def build_video():
         if not clip_paths:
             return jsonify({"success": False, "error": "No clips"}), 400
 
+        # Concatenate clips
         if len(clip_paths) > 1:
             concat_list = os.path.join(work_dir, "concat.txt")
             with open(concat_list, "w") as f:
@@ -126,6 +121,7 @@ def build_video():
         else:
             main_clip = clip_paths[0]
 
+        # Build video - VERY compressed to fit n8n memory
         output_path = os.path.join(work_dir, "output.mp4")
         safe_title = title.replace("'", "").replace(":", "-").replace('"', '')[:50]
         filters = (
@@ -143,22 +139,25 @@ def build_video():
                 "-i", audio_path,
                 "-vf", filters,
                 "-map", "0:v:0", "-map", "1:a:0",
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "35",
-                "-vb", "300k",
-                "-c:a", "aac", "-b:a", "96k",
-                "-shortest", "-t", "600",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "38",
+                "-vb", "150k",
+                "-c:a", "aac", "-b:a", "64k",
+                "-shortest", "-t", "480",
                 output_path
             ]
         else:
             cmd = [
                 "ffmpeg", "-y", "-i", main_clip,
                 "-vf", filters,
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "35",
-                "-vb", "300k", "-an", "-t", "300",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "38",
+                "-vb", "150k", "-an", "-t", "300",
                 output_path
             ]
 
         subprocess.run(cmd, check=True, capture_output=True, timeout=600)
+
+        size = os.path.getsize(output_path)
+        print(f"Output size: {size} bytes")
 
         with open(output_path, "rb") as f:
             video_b64 = base64.b64encode(f.read()).decode()
