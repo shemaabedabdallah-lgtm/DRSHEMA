@@ -1,175 +1,128 @@
+from flask import Flask, request, jsonify
+import subprocess
+import tempfile
 import os
 import requests
-import subprocess
-import base64
-import tempfile
-import shutil
 import asyncio
-from flask import Flask, request, jsonify
+import edge_tts
 
 app = Flask(__name__)
-WATERMARK_TEXT = "DR SHEMA"
 
-def generate_voice(script, audio_path):
-    """Try edge-tts first, then espeak"""
-    
-    # Method 1: edge-tts (Microsoft, natural voice)
-    try:
-        import edge_tts
-        mp3_path = audio_path.replace('.wav', '.mp3')
-        
-        async def do_tts():
-            communicate = edge_tts.Communicate(script[:8000], "en-US-GuyNeural")
-            await communicate.save(mp3_path)
-        
-        asyncio.run(do_tts())
-        
-        if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 1000:
-            subprocess.run(["ffmpeg", "-y", "-i", mp3_path, audio_path],
-                         check=True, capture_output=True, timeout=30)
-            if os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000:
-                print(f"edge-tts SUCCESS: {os.path.getsize(audio_path)} bytes")
-                return True
-    except Exception as e:
-        print(f"edge-tts failed: {e}")
+VOICE = "en-US-ChristopherNeural"  # Deep professional male voice
 
-    # Method 2: espeak (system installed via Docker)
-    try:
-        subprocess.run(
-            ["espeak", "-v", "en+m3", "-s", "145", "-p", "35", "-w", audio_path, script[:8000]],
-            check=True, capture_output=True, timeout=120
-        )
-        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000:
-            print(f"espeak SUCCESS: {os.path.getsize(audio_path)} bytes")
-            return True
-    except Exception as e:
-        print(f"espeak failed: {e}")
+async def generate_audio(text, output_path):
+    communicate = edge_tts.Communicate(text, VOICE)
+    await communicate.save(output_path)
 
-    # Method 3: espeak-ng
-    try:
-        subprocess.run(
-            ["espeak-ng", "-v", "en-us+m3", "-s", "145", "-p", "35", "-w", audio_path, script[:8000]],
-            check=True, capture_output=True, timeout=120
-        )
-        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000:
-            print(f"espeak-ng SUCCESS: {os.path.getsize(audio_path)} bytes")
-            return True
-    except Exception as e:
-        print(f"espeak-ng failed: {e}")
+def download_video(url, path):
+    r = requests.get(url, stream=True, timeout=30)
+    with open(path, 'wb') as f:
+        for chunk in r.iter_content(chunk_size=8192):
+            f.write(chunk)
 
-    print("All TTS failed")
-    return False
-
-@app.route("/health", methods=["GET"])
-def health():
-    tts = []
-    try:
-        import edge_tts
-        tts.append("edge-tts")
-    except:
-        pass
-    for cmd in ["espeak", "espeak-ng", "flite"]:
-        try:
-            subprocess.run([cmd, "--version"], capture_output=True, timeout=5)
-            tts.append(cmd)
-        except:
-            pass
-    return jsonify({"status": "ok", "service": "DR SHEMA Docker", "tts": tts})
-
-@app.route("/build", methods=["POST"])
+@app.route('/build', methods=['POST'])
 def build_video():
-    data = request.json or {}
-    title = data.get("title", "DR SHEMA News")
-    script = data.get("script", "Welcome to DR SHEMA.")
-    clip_urls = [data.get("clip1_url"), data.get("clip2_url"), data.get("clip3_url")]
-    clip_urls = [u for u in clip_urls if u]
-
-    work_dir = tempfile.mkdtemp()
     try:
-        # Generate voice
-        audio_path = os.path.join(work_dir, "voice.wav")
-        has_audio = generate_voice(script, audio_path)
+        data = request.get_json()
+        script = data.get('script', '')
+        title = data.get('title', 'video')
+        clip1_url = data.get('clip1_url', '')
+        clip2_url = data.get('clip2_url', '')
+        clip3_url = data.get('clip3_url', '')
 
-        # Download clips
-        clip_paths = []
-        for i, url in enumerate(clip_urls[:3]):
-            try:
-                clip_path = os.path.join(work_dir, f"clip{i}.mp4")
-                r = requests.get(url, timeout=60, stream=True)
-                with open(clip_path, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=524288):
-                        f.write(chunk)
-                if os.path.exists(clip_path) and os.path.getsize(clip_path) > 1000:
-                    clip_paths.append(clip_path)
-            except Exception as e:
-                print(f"Clip {i} error: {e}")
+        with tempfile.TemporaryDirectory() as tmpdir:
 
-        if not clip_paths:
-            return jsonify({"success": False, "error": "No clips"}), 400
+            # Step 1: Generate male audio with edge-tts
+            audio_path = os.path.join(tmpdir, 'speech.mp3')
+            asyncio.run(generate_audio(script, audio_path))
 
-        # Concatenate clips
-        if len(clip_paths) > 1:
-            concat_list = os.path.join(work_dir, "concat.txt")
-            with open(concat_list, "w") as f:
-                for p in clip_paths:
-                    f.write(f"file '{p}'\n")
-            concat_path = os.path.join(work_dir, "concat.mp4")
-            subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0",
-                          "-i", concat_list, "-c", "copy", concat_path],
-                         check=True, capture_output=True, timeout=120)
-            main_clip = concat_path
-        else:
-            main_clip = clip_paths[0]
+            if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
+                return jsonify({'success': False, 'error': 'Audio generation failed'}), 500
 
-        # Build video - VERY compressed to fit n8n memory
-        output_path = os.path.join(work_dir, "output.mp4")
-        safe_title = title.replace("'", "").replace(":", "-").replace('"', '')[:50]
-        filters = (
-            f"scale=640:360,"
-            f"drawtext=text='{WATERMARK_TEXT}':fontsize=24:fontcolor=white@0.8"
-            f":x=10:y=10:shadowcolor=black:shadowx=2:shadowy=2,"
-            f"drawtext=text='{safe_title}':fontsize=18:fontcolor=yellow"
-            f":x=(w-text_w)/2:y=h-40:box=1:boxcolor=black@0.5:boxborderw=5"
-        )
+            # Step 2: Get audio duration
+            result = subprocess.run(
+                ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                 '-of', 'default=noprint_wrappers=1:nokey=1', audio_path],
+                capture_output=True, text=True
+            )
+            audio_duration = float(result.stdout.strip() or '45')
+            audio_duration = min(audio_duration, 480)  # Max 8 minutes
 
-        if has_audio:
-            cmd = [
-                "ffmpeg", "-y",
-                "-stream_loop", "-1", "-i", main_clip,
-                "-i", audio_path,
-                "-vf", filters,
-                "-map", "0:v:0", "-map", "1:a:0",
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "38",
-                "-vb", "150k",
-                "-c:a", "aac", "-b:a", "64k",
-                "-shortest", "-t", "480",
-                output_path
-            ]
-        else:
-            cmd = [
-                "ffmpeg", "-y", "-i", main_clip,
-                "-vf", filters,
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "38",
-                "-vb", "150k", "-an", "-t", "300",
-                output_path
-            ]
+            # Step 3: Download video clips
+            clip_paths = []
+            for i, url in enumerate([clip1_url, clip2_url, clip3_url]):
+                if url:
+                    p = os.path.join(tmpdir, f'clip{i}.mp4')
+                    download_video(url, p)
+                    clip_paths.append(p)
 
-        subprocess.run(cmd, check=True, capture_output=True, timeout=600)
+            if not clip_paths:
+                return jsonify({'success': False, 'error': 'No video clips'}), 500
 
-        size = os.path.getsize(output_path)
-        print(f"Output size: {size} bytes")
+            # Step 4: Build looped video to match audio duration
+            clip_duration = audio_duration / len(clip_paths)
+            trimmed = []
+            for i, cp in enumerate(clip_paths):
+                out = os.path.join(tmpdir, f'trimmed{i}.mp4')
+                subprocess.run([
+                    'ffmpeg', '-y', '-i', cp,
+                    '-t', str(clip_duration),
+                    '-vf', 'scale=640:360,setsar=1',
+                    '-r', '25', '-an',
+                    '-c:v', 'libx264', '-preset', 'ultrafast',
+                    '-b:v', '150k', out
+                ], capture_output=True)
+                trimmed.append(out)
 
-        with open(output_path, "rb") as f:
-            video_b64 = base64.b64encode(f.read()).decode()
+            # Step 5: Concatenate clips
+            concat_list = os.path.join(tmpdir, 'list.txt')
+            with open(concat_list, 'w') as f:
+                for t in trimmed:
+                    f.write(f"file '{t}'\n")
 
-        return jsonify({"success": True, "video": video_b64, "title": title, "has_audio": has_audio})
+            concat_out = os.path.join(tmpdir, 'concat.mp4')
+            subprocess.run([
+                'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
+                '-i', concat_list, '-c', 'copy', concat_out
+            ], capture_output=True)
+
+            # Step 6: Merge video + audio
+            final_out = os.path.join(tmpdir, 'final.mp4')
+            subprocess.run([
+                'ffmpeg', '-y',
+                '-i', concat_out,
+                '-i', audio_path,
+                '-map', '0:v:0', '-map', '1:a:0',
+                '-c:v', 'libx264', '-preset', 'ultrafast',
+                '-b:v', '150k', '-vf', 'scale=640:360',
+                '-c:a', 'aac', '-b:a', '64k',
+                '-shortest', final_out
+            ], capture_output=True)
+
+            if not os.path.exists(final_out) or os.path.getsize(final_out) == 0:
+                return jsonify({'success': False, 'error': 'Final video build failed'}), 500
+
+            # Step 7: Read and return video
+            with open(final_out, 'rb') as f:
+                video_bytes = f.read()
+
+            import base64
+            video_b64 = base64.b64encode(video_bytes).decode('utf-8')
+
+            return jsonify({
+                'success': True,
+                'has_audio': True,
+                'title': title,
+                'video': video_b64
+            })
 
     except Exception as e:
-        print(f"Error: {e}")
-        return jsonify({"success": False, "error": str(e)[:300]}), 500
-    finally:
-        shutil.rmtree(work_dir, ignore_errors=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, threaded=False)
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({'status': 'ok', 'voice': VOICE})
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
