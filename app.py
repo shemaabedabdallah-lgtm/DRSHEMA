@@ -10,82 +10,13 @@ app = Flask(__name__)
 
 VOICE = "en-US-ChristopherNeural"
 
-async def generate_edge_tts(text, output_path, srt_path):
+async def generate_edge_tts_audio(text, output_path):
     import edge_tts
     communicate = edge_tts.Communicate(text, VOICE)
-    words = []
-    async for event in communicate.stream():
-        if event["type"] == "WordBoundary":
-            words.append({
-                "word": event["text"],
-                "start": event["offset"] / 10_000_000,
-                "duration": event["duration"] / 10_000_000
-            })
-    communicate2 = edge_tts.Communicate(text, VOICE)
-    await communicate2.save(output_path)
-    build_srt(words, srt_path)
+    await communicate.save(output_path)
 
-def build_srt(words, srt_path):
-    if not words:
-        return
-    lines = []
-    chunk = []
-    chunk_start = None
-    for w in words:
-        if chunk_start is None:
-            chunk_start = w["start"]
-        chunk.append(w["word"])
-        if len(chunk) >= 5:
-            end = w["start"] + w["duration"]
-            lines.append((chunk_start, end, " ".join(chunk)))
-            chunk = []
-            chunk_start = None
-    if chunk:
-        end = words[-1]["start"] + words[-1]["duration"]
-        lines.append((chunk_start, end, " ".join(chunk)))
-
-    def fmt_time(t):
-        h = int(t // 3600)
-        m = int((t % 3600) // 60)
-        s = int(t % 60)
-        ms = int((t % 1) * 1000)
-        return f"{h:02}:{m:02}:{s:02},{ms:03}"
-
-    with open(srt_path, 'w', encoding='utf-8') as f:
-        for i, (start, end, text) in enumerate(lines, 1):
-            f.write(f"{i}\n{fmt_time(start)} --> {fmt_time(end)}\n{text}\n\n")
-
-def generate_audio(script, tmpdir):
-    audio_path = os.path.join(tmpdir, 'speech.mp3')
-    srt_path = os.path.join(tmpdir, 'captions.srt')
-
-    # Method 1: edge-tts
-    try:
-        print("[TTS] Trying edge-tts...")
-        asyncio.run(generate_edge_tts(script, audio_path, srt_path))
-        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000:
-            print(f"[TTS] edge-tts SUCCESS: {os.path.getsize(audio_path)} bytes")
-            return audio_path, srt_path
-    except Exception as e:
-        print(f"[TTS] edge-tts FAILED: {e}")
-        traceback.print_exc()
-
-    # Method 2: gtts
-    try:
-        print("[TTS] Trying gtts...")
-        from gtts import gTTS
-        tts = gTTS(text=script, lang='en', slow=False)
-        tts.save(audio_path)
-        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000:
-            print(f"[TTS] gtts SUCCESS")
-            build_basic_srt(script, audio_path, srt_path)
-            return audio_path, srt_path
-    except Exception as e:
-        print(f"[TTS] gtts FAILED: {e}")
-
-    return None, None
-
-def build_basic_srt(script, audio_path, srt_path):
+def build_srt_from_duration(script, audio_path, srt_path):
+    """Build SRT file based on audio duration — always works"""
     try:
         result = subprocess.run(
             ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
@@ -108,10 +39,46 @@ def build_basic_srt(script, audio_path, srt_path):
         with open(srt_path, 'w', encoding='utf-8') as f:
             for i, chunk in enumerate(chunks):
                 start = i * time_per_chunk
-                end = start + time_per_chunk
-                f.write(f"{i+1}\n{fmt_time(start)} --> {fmt_time(end)}\n{' '.join(chunk)}\n\n")
+                end = start + time_per_chunk - 0.05
+                text_upper = ' '.join(chunk).upper()
+                f.write(f"{i+1}\n{fmt_time(start)} --> {fmt_time(end)}\n{text_upper}\n\n")
+
+        print(f"[SRT] Built {len(chunks)} caption chunks over {duration:.1f}s")
+        return True
     except Exception as e:
-        print(f"[SRT] basic SRT failed: {e}")
+        print(f"[SRT] Failed: {e}")
+        return False
+
+def generate_audio(script, tmpdir):
+    audio_path = os.path.join(tmpdir, 'speech.mp3')
+    srt_path = os.path.join(tmpdir, 'captions.srt')
+
+    # Method 1: edge-tts
+    try:
+        print("[TTS] Trying edge-tts...")
+        asyncio.run(generate_edge_tts_audio(script, audio_path))
+        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000:
+            print(f"[TTS] edge-tts SUCCESS: {os.path.getsize(audio_path)} bytes")
+            build_srt_from_duration(script, audio_path, srt_path)
+            return audio_path, srt_path
+    except Exception as e:
+        print(f"[TTS] edge-tts FAILED: {e}")
+        traceback.print_exc()
+
+    # Method 2: gtts
+    try:
+        print("[TTS] Trying gtts...")
+        from gtts import gTTS
+        tts = gTTS(text=script, lang='en', slow=False)
+        tts.save(audio_path)
+        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000:
+            print(f"[TTS] gtts SUCCESS")
+            build_srt_from_duration(script, audio_path, srt_path)
+            return audio_path, srt_path
+    except Exception as e:
+        print(f"[TTS] gtts FAILED: {e}")
+
+    return None, None
 
 def download_video(url, path):
     r = requests.get(url, stream=True, timeout=30)
@@ -133,7 +100,7 @@ def build_video():
 
         with tempfile.TemporaryDirectory() as tmpdir:
 
-            # Step 1: Generate audio + captions
+            # Step 1: Generate audio + SRT
             audio_path, srt_path = generate_audio(script, tmpdir)
             has_audio = audio_path and os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000
             has_srt = srt_path and os.path.exists(srt_path) and os.path.getsize(srt_path) > 10
@@ -200,21 +167,20 @@ def build_video():
 
             if has_srt:
                 srt_escaped = srt_path.replace('\\', '/').replace(':', '\\:')
-                # BOLD YELLOW captions - large, punchy, TikTok style
+                # BOLD WHITE captions with black outline — news style
                 vf = (
                     f"scale=640:360,"
                     f"subtitles='{srt_escaped}':force_style='"
                     f"FontName=Arial,"
-                    f"FontSize=22,"
+                    f"FontSize=20,"
                     f"Bold=1,"
-                    f"PrimaryColour=&H00FFFF00,"
+                    f"PrimaryColour=&H00FFFFFF,"
                     f"OutlineColour=&H00000000,"
                     f"BackColour=&H80000000,"
                     f"Outline=3,"
                     f"Shadow=2,"
                     f"Alignment=2,"
-                    f"MarginV=25,"
-                    f"Uppercase=1'"
+                    f"MarginV=25'"
                 )
                 r = subprocess.run([
                     'ffmpeg', '-y',
@@ -227,7 +193,19 @@ def build_video():
                     '-c:a', 'aac', '-b:a', '64k',
                     '-shortest', final_out
                 ], capture_output=True, timeout=300)
-                print(f"[BUILD] FFmpeg: {r.stderr.decode()[-200:]}")
+                print(f"[BUILD] FFmpeg captions: {r.returncode}")
+                if r.returncode != 0:
+                    print(f"[BUILD] Caption error: {r.stderr.decode()[-300:]}")
+                    # Fallback: no captions
+                    subprocess.run([
+                        'ffmpeg', '-y',
+                        '-i', concat_out, '-i', audio_path,
+                        '-map', '0:v:0', '-map', '1:a:0',
+                        '-c:v', 'libx264', '-preset', 'ultrafast',
+                        '-b:v', '150k', '-vf', 'scale=640:360',
+                        '-c:a', 'aac', '-b:a', '64k',
+                        '-shortest', final_out
+                    ], capture_output=True)
             else:
                 subprocess.run([
                     'ffmpeg', '-y',
@@ -243,7 +221,7 @@ def build_video():
                 return jsonify({'success': False, 'error': 'Final video failed'}), 500
 
             file_size = os.path.getsize(final_out)
-            print(f"[BUILD] Final size: {file_size} bytes")
+            print(f"[BUILD] Final: {file_size} bytes ✅")
 
             with open(final_out, 'rb') as f:
                 video_bytes = f.read()
@@ -256,7 +234,7 @@ def build_video():
                 'has_audio': True,
                 'has_captions': has_srt,
                 'file_size': file_size,
-                'duration': audio_duration,
+                'duration': round(audio_duration, 1),
                 'title': title,
                 'video': video_b64
             })
@@ -267,7 +245,7 @@ def build_video():
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'voice': VOICE, 'captions': 'bold_yellow'})
+    return jsonify({'status': 'ok', 'voice': VOICE, 'captions': 'bold_white'})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
