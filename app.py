@@ -5,7 +5,6 @@ import os
 import requests
 import asyncio
 import traceback
-import math
 
 app = Flask(__name__)
 
@@ -22,14 +21,11 @@ async def generate_edge_tts(text, output_path, srt_path):
                 "start": event["offset"] / 10_000_000,
                 "duration": event["duration"] / 10_000_000
             })
-    # Save audio separately
     communicate2 = edge_tts.Communicate(text, VOICE)
     await communicate2.save(output_path)
-    # Build SRT from word timings
     build_srt(words, srt_path)
 
 def build_srt(words, srt_path):
-    """Group words into subtitle lines of ~6 words each"""
     if not words:
         return
     lines = []
@@ -39,7 +35,7 @@ def build_srt(words, srt_path):
         if chunk_start is None:
             chunk_start = w["start"]
         chunk.append(w["word"])
-        if len(chunk) >= 6:
+        if len(chunk) >= 5:
             end = w["start"] + w["duration"]
             lines.append((chunk_start, end, " ".join(chunk)))
             chunk = []
@@ -63,53 +59,33 @@ def generate_audio(script, tmpdir):
     audio_path = os.path.join(tmpdir, 'speech.mp3')
     srt_path = os.path.join(tmpdir, 'captions.srt')
 
-    # Method 1: edge-tts with word timings
+    # Method 1: edge-tts
     try:
         print("[TTS] Trying edge-tts...")
         asyncio.run(generate_edge_tts(script, audio_path, srt_path))
         if os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000:
             print(f"[TTS] edge-tts SUCCESS: {os.path.getsize(audio_path)} bytes")
             return audio_path, srt_path
-        else:
-            print("[TTS] edge-tts produced empty file")
     except Exception as e:
         print(f"[TTS] edge-tts FAILED: {e}")
         traceback.print_exc()
 
-    # Method 2: gtts (no word timings, generate basic SRT)
+    # Method 2: gtts
     try:
         print("[TTS] Trying gtts...")
         from gtts import gTTS
         tts = gTTS(text=script, lang='en', slow=False)
         tts.save(audio_path)
         if os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000:
-            print(f"[TTS] gtts SUCCESS: {os.path.getsize(audio_path)} bytes")
+            print(f"[TTS] gtts SUCCESS")
             build_basic_srt(script, audio_path, srt_path)
             return audio_path, srt_path
     except Exception as e:
         print(f"[TTS] gtts FAILED: {e}")
 
-    # Method 3: espeak
-    try:
-        print("[TTS] Trying espeak...")
-        wav_path = os.path.join(tmpdir, 'speech.wav')
-        subprocess.run(
-            ['espeak', '-v', 'en-us+m3', '-s', '145', '-p', '35',
-             '-w', wav_path, script[:2000]],
-            capture_output=True, timeout=60
-        )
-        if os.path.exists(wav_path) and os.path.getsize(wav_path) > 1000:
-            subprocess.run(['ffmpeg', '-y', '-i', wav_path, audio_path], capture_output=True)
-            if os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000:
-                build_basic_srt(script, audio_path, srt_path)
-                return audio_path, srt_path
-    except Exception as e:
-        print(f"[TTS] espeak FAILED: {e}")
-
     return None, None
 
 def build_basic_srt(script, audio_path, srt_path):
-    """Estimate timing when word-level data unavailable"""
     try:
         result = subprocess.run(
             ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
@@ -118,7 +94,7 @@ def build_basic_srt(script, audio_path, srt_path):
         )
         duration = float(result.stdout.strip() or '60')
         words = script.split()
-        chunk_size = 6
+        chunk_size = 5
         chunks = [words[i:i+chunk_size] for i in range(0, len(words), chunk_size)]
         time_per_chunk = duration / max(len(chunks), 1)
 
@@ -153,18 +129,18 @@ def build_video():
         clip2_url = data.get('clip2_url', '')
         clip3_url = data.get('clip3_url', '')
 
-        print(f"[BUILD] Starting: {title[:50]}")
+        print(f"[BUILD] Starting: {title[:60]}")
 
         with tempfile.TemporaryDirectory() as tmpdir:
 
-            # Step 1: Generate audio + SRT captions
+            # Step 1: Generate audio + captions
             audio_path, srt_path = generate_audio(script, tmpdir)
             has_audio = audio_path and os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000
+            has_srt = srt_path and os.path.exists(srt_path) and os.path.getsize(srt_path) > 10
 
             if not has_audio:
-                return jsonify({'success': False, 'error': 'All TTS methods failed', 'has_audio': False}), 500
+                return jsonify({'success': False, 'error': 'All TTS methods failed'}), 500
 
-            has_srt = srt_path and os.path.exists(srt_path) and os.path.getsize(srt_path) > 10
             print(f"[BUILD] has_audio={has_audio}, has_srt={has_srt}")
 
             # Step 2: Audio duration
@@ -175,6 +151,7 @@ def build_video():
             )
             audio_duration = float(result.stdout.strip() or '45')
             audio_duration = min(audio_duration, 480)
+            print(f"[BUILD] Duration: {audio_duration:.1f}s")
 
             # Step 3: Download clips
             clip_paths = []
@@ -218,19 +195,26 @@ def build_video():
                 '-i', concat_list, '-c', 'copy', concat_out
             ], capture_output=True)
 
-            # Step 6: Burn captions + merge audio
+            # Step 6: Burn BOLD captions + merge audio
             final_out = os.path.join(tmpdir, 'final.mp4')
 
             if has_srt:
-                # Escape srt path for ffmpeg filter
-                srt_escaped = srt_path.replace(':', '\\:').replace("'", "\\'")
+                srt_escaped = srt_path.replace('\\', '/').replace(':', '\\:')
+                # BOLD YELLOW captions - large, punchy, TikTok style
                 vf = (
                     f"scale=640:360,"
                     f"subtitles='{srt_escaped}':force_style='"
-                    f"FontName=Arial,FontSize=16,Bold=1,"
-                    f"PrimaryColour=&HFFFFFF,OutlineColour=&H000000,"
-                    f"Outline=2,Shadow=1,Alignment=2,"
-                    f"MarginV=20'"
+                    f"FontName=Arial,"
+                    f"FontSize=22,"
+                    f"Bold=1,"
+                    f"PrimaryColour=&H00FFFF00,"
+                    f"OutlineColour=&H00000000,"
+                    f"BackColour=&H80000000,"
+                    f"Outline=3,"
+                    f"Shadow=2,"
+                    f"Alignment=2,"
+                    f"MarginV=25,"
+                    f"Uppercase=1'"
                 )
                 r = subprocess.run([
                     'ffmpeg', '-y',
@@ -243,9 +227,8 @@ def build_video():
                     '-c:a', 'aac', '-b:a', '64k',
                     '-shortest', final_out
                 ], capture_output=True, timeout=300)
-                print(f"[BUILD] FFmpeg captions stderr: {r.stderr.decode()[-300:]}")
+                print(f"[BUILD] FFmpeg: {r.stderr.decode()[-200:]}")
             else:
-                # No captions — just merge
                 subprocess.run([
                     'ffmpeg', '-y',
                     '-i', concat_out, '-i', audio_path,
@@ -259,7 +242,8 @@ def build_video():
             if not os.path.exists(final_out) or os.path.getsize(final_out) == 0:
                 return jsonify({'success': False, 'error': 'Final video failed'}), 500
 
-            print(f"[BUILD] Final: {os.path.getsize(final_out)} bytes")
+            file_size = os.path.getsize(final_out)
+            print(f"[BUILD] Final size: {file_size} bytes")
 
             with open(final_out, 'rb') as f:
                 video_bytes = f.read()
@@ -271,6 +255,8 @@ def build_video():
                 'success': True,
                 'has_audio': True,
                 'has_captions': has_srt,
+                'file_size': file_size,
+                'duration': audio_duration,
                 'title': title,
                 'video': video_b64
             })
@@ -281,7 +267,7 @@ def build_video():
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'voice': VOICE, 'captions': True})
+    return jsonify({'status': 'ok', 'voice': VOICE, 'captions': 'bold_yellow'})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
