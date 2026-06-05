@@ -15,8 +15,8 @@ async def generate_edge_tts_audio(text, output_path):
     communicate = edge_tts.Communicate(text, VOICE)
     await communicate.save(output_path)
 
-def build_srt_from_duration(script, audio_path, srt_path):
-    """Build SRT file based on audio duration — always works"""
+def build_word_by_word_srt(script, audio_path, srt_path):
+    """Build word-by-word karaoke style SRT"""
     try:
         result = subprocess.run(
             ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
@@ -25,9 +25,8 @@ def build_srt_from_duration(script, audio_path, srt_path):
         )
         duration = float(result.stdout.strip() or '60')
         words = script.split()
-        chunk_size = 5
-        chunks = [words[i:i+chunk_size] for i in range(0, len(words), chunk_size)]
-        time_per_chunk = duration / max(len(chunks), 1)
+        total_words = len(words)
+        time_per_word = duration / max(total_words, 1)
 
         def fmt_time(t):
             h = int(t // 3600)
@@ -36,14 +35,20 @@ def build_srt_from_duration(script, audio_path, srt_path):
             ms = int((t % 1) * 1000)
             return f"{h:02}:{m:02}:{s:02},{ms:03}"
 
-        with open(srt_path, 'w', encoding='utf-8') as f:
-            for i, chunk in enumerate(chunks):
-                start = i * time_per_chunk
-                end = start + time_per_chunk - 0.05
-                text_upper = ' '.join(chunk).upper()
-                f.write(f"{i+1}\n{fmt_time(start)} --> {fmt_time(end)}\n{text_upper}\n\n")
+        # Group into lines of 3 words for readability
+        chunk_size = 3
+        chunks = []
+        for i in range(0, total_words, chunk_size):
+            chunk_words = words[i:i+chunk_size]
+            start_time = i * time_per_word
+            end_time = (i + len(chunk_words)) * time_per_word
+            chunks.append((start_time, end_time, ' '.join(chunk_words).upper()))
 
-        print(f"[SRT] Built {len(chunks)} caption chunks over {duration:.1f}s")
+        with open(srt_path, 'w', encoding='utf-8') as f:
+            for i, (start, end, text) in enumerate(chunks, 1):
+                f.write(f"{i}\n{fmt_time(start)} --> {fmt_time(end)}\n{text}\n\n")
+
+        print(f"[SRT] Built {len(chunks)} word-by-word chunks over {duration:.1f}s")
         return True
     except Exception as e:
         print(f"[SRT] Failed: {e}")
@@ -59,7 +64,7 @@ def generate_audio(script, tmpdir):
         asyncio.run(generate_edge_tts_audio(script, audio_path))
         if os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000:
             print(f"[TTS] edge-tts SUCCESS: {os.path.getsize(audio_path)} bytes")
-            build_srt_from_duration(script, audio_path, srt_path)
+            build_word_by_word_srt(script, audio_path, srt_path)
             return audio_path, srt_path
     except Exception as e:
         print(f"[TTS] edge-tts FAILED: {e}")
@@ -73,7 +78,7 @@ def generate_audio(script, tmpdir):
         tts.save(audio_path)
         if os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000:
             print(f"[TTS] gtts SUCCESS")
-            build_srt_from_duration(script, audio_path, srt_path)
+            build_word_by_word_srt(script, audio_path, srt_path)
             return audio_path, srt_path
     except Exception as e:
         print(f"[TTS] gtts FAILED: {e}")
@@ -81,10 +86,65 @@ def generate_audio(script, tmpdir):
     return None, None
 
 def download_video(url, path):
-    r = requests.get(url, stream=True, timeout=30)
+    r = requests.get(url, stream=True, timeout=60)
     with open(path, 'wb') as f:
         for chunk in r.iter_content(chunk_size=8192):
             f.write(chunk)
+
+def loop_clip_to_duration(clip_path, target_duration, output_path, clip_index):
+    """Loop a short clip to fill target duration"""
+    try:
+        # Get clip duration
+        result = subprocess.run(
+            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+             '-of', 'default=noprint_wrappers=1:nokey=1', clip_path],
+            capture_output=True, text=True
+        )
+        clip_dur = float(result.stdout.strip() or '5')
+        print(f"[CLIP {clip_index}] Original duration: {clip_dur:.1f}s, need: {target_duration:.1f}s")
+
+        if clip_dur >= target_duration:
+            # Clip is long enough, just trim it
+            subprocess.run([
+                'ffmpeg', '-y', '-i', clip_path,
+                '-t', str(target_duration),
+                '-vf', 'scale=640:360,setsar=1',
+                '-r', '25', '-an',
+                '-c:v', 'libx264', '-preset', 'ultrafast',
+                '-b:v', '200k', output_path
+            ], capture_output=True)
+        else:
+            # Loop clip to fill duration
+            loops_needed = int(target_duration / clip_dur) + 2
+            # Create concat list with loops
+            tmp_list = output_path + '_list.txt'
+            with open(tmp_list, 'w') as f:
+                for _ in range(loops_needed):
+                    f.write(f"file '{clip_path}'\n")
+            
+            looped = output_path + '_looped.mp4'
+            subprocess.run([
+                'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
+                '-i', tmp_list, '-t', str(target_duration),
+                '-vf', 'scale=640:360,setsar=1',
+                '-r', '25', '-an',
+                '-c:v', 'libx264', '-preset', 'ultrafast',
+                '-b:v', '200k', looped
+            ], capture_output=True)
+            
+            os.rename(looped, output_path)
+            try:
+                os.remove(tmp_list)
+            except:
+                pass
+
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            print(f"[CLIP {clip_index}] Processed successfully")
+            return True
+        return False
+    except Exception as e:
+        print(f"[CLIP {clip_index}] Processing failed: {e}")
+        return False
 
 @app.route('/build', methods=['POST'])
 def build_video():
@@ -97,10 +157,11 @@ def build_video():
         clip3_url = data.get('clip3_url', '')
 
         print(f"[BUILD] Starting: {title[:60]}")
+        print(f"[BUILD] Script length: {len(script)} chars")
 
         with tempfile.TemporaryDirectory() as tmpdir:
 
-            # Step 1: Generate audio + SRT
+            # Step 1: Generate audio + word-by-word captions
             audio_path, srt_path = generate_audio(script, tmpdir)
             has_audio = audio_path and os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000
             has_srt = srt_path and os.path.exists(srt_path) and os.path.getsize(srt_path) > 10
@@ -108,9 +169,7 @@ def build_video():
             if not has_audio:
                 return jsonify({'success': False, 'error': 'All TTS methods failed'}), 500
 
-            print(f"[BUILD] has_audio={has_audio}, has_srt={has_srt}")
-
-            # Step 2: Audio duration
+            # Step 2: Get FULL audio duration
             result = subprocess.run(
                 ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
                  '-of', 'default=noprint_wrappers=1:nokey=1', audio_path],
@@ -118,43 +177,41 @@ def build_video():
             )
             audio_duration = float(result.stdout.strip() or '45')
             audio_duration = min(audio_duration, 480)
-            print(f"[BUILD] Duration: {audio_duration:.1f}s")
+            print(f"[BUILD] Full audio duration: {audio_duration:.1f}s")
 
             # Step 3: Download clips
-            clip_paths = []
-            for i, url in enumerate([clip1_url, clip2_url, clip3_url]):
-                if url:
-                    p = os.path.join(tmpdir, f'clip{i}.mp4')
-                    try:
-                        download_video(url, p)
-                        clip_paths.append(p)
-                    except Exception as e:
-                        print(f"[BUILD] Clip {i} failed: {e}")
+            clip_urls = [u for u in [clip1_url, clip2_url, clip3_url] if u]
+            raw_clips = []
+            for i, url in enumerate(clip_urls):
+                p = os.path.join(tmpdir, f'raw_clip{i}.mp4')
+                try:
+                    download_video(url, p)
+                    raw_clips.append(p)
+                    size = os.path.getsize(p)
+                    print(f"[BUILD] Raw clip {i}: {size} bytes")
+                except Exception as e:
+                    print(f"[BUILD] Clip {i} download failed: {e}")
 
-            if not clip_paths:
+            if not raw_clips:
                 return jsonify({'success': False, 'error': 'No clips downloaded'}), 500
 
-            # Step 4: Trim clips
-            clip_duration = audio_duration / len(clip_paths)
-            trimmed = []
-            for i, cp in enumerate(clip_paths):
-                out = os.path.join(tmpdir, f'trimmed{i}.mp4')
-                subprocess.run([
-                    'ffmpeg', '-y', '-i', cp,
-                    '-t', str(clip_duration),
-                    '-vf', 'scale=640:360,setsar=1',
-                    '-r', '25', '-an',
-                    '-c:v', 'libx264', '-preset', 'ultrafast',
-                    '-b:v', '150k', out
-                ], capture_output=True)
-                if os.path.exists(out):
-                    trimmed.append(out)
+            # Step 4: Process each clip — loop short clips to fill their share of duration
+            clip_duration = audio_duration / len(raw_clips)
+            processed_clips = []
+            for i, rp in enumerate(raw_clips):
+                out = os.path.join(tmpdir, f'proc_clip{i}.mp4')
+                success = loop_clip_to_duration(rp, clip_duration, out, i)
+                if success:
+                    processed_clips.append(out)
 
-            # Step 5: Concatenate
-            concat_list = os.path.join(tmpdir, 'list.txt')
+            if not processed_clips:
+                return jsonify({'success': False, 'error': 'No clips processed'}), 500
+
+            # Step 5: Concatenate all processed clips
+            concat_list = os.path.join(tmpdir, 'concat_list.txt')
             with open(concat_list, 'w') as f:
-                for t in trimmed:
-                    f.write(f"file '{t}'\n")
+                for cp in processed_clips:
+                    f.write(f"file '{cp}'\n")
 
             concat_out = os.path.join(tmpdir, 'concat.mp4')
             subprocess.run([
@@ -162,12 +219,12 @@ def build_video():
                 '-i', concat_list, '-c', 'copy', concat_out
             ], capture_output=True)
 
-            # Step 6: Burn BOLD captions + merge audio
+            # Step 6: Burn word-by-word captions + merge audio
             final_out = os.path.join(tmpdir, 'final.mp4')
 
             if has_srt:
                 srt_escaped = srt_path.replace('\\', '/').replace(':', '\\:')
-                # BOLD WHITE captions with black outline — news style
+                # Bold white word-by-word captions
                 vf = (
                     f"scale=640:360,"
                     f"subtitles='{srt_escaped}':force_style='"
@@ -193,16 +250,15 @@ def build_video():
                     '-c:a', 'aac', '-b:a', '64k',
                     '-shortest', final_out
                 ], capture_output=True, timeout=300)
-                print(f"[BUILD] FFmpeg captions: {r.returncode}")
+                print(f"[BUILD] FFmpeg captions returncode: {r.returncode}")
                 if r.returncode != 0:
-                    print(f"[BUILD] Caption error: {r.stderr.decode()[-300:]}")
-                    # Fallback: no captions
+                    print(f"[BUILD] Caption error, falling back: {r.stderr.decode()[-200:]}")
                     subprocess.run([
                         'ffmpeg', '-y',
                         '-i', concat_out, '-i', audio_path,
                         '-map', '0:v:0', '-map', '1:a:0',
                         '-c:v', 'libx264', '-preset', 'ultrafast',
-                        '-b:v', '150k', '-vf', 'scale=640:360',
+                        '-b:v', '200k', '-vf', 'scale=640:360',
                         '-c:a', 'aac', '-b:a', '64k',
                         '-shortest', final_out
                     ], capture_output=True)
@@ -212,7 +268,7 @@ def build_video():
                     '-i', concat_out, '-i', audio_path,
                     '-map', '0:v:0', '-map', '1:a:0',
                     '-c:v', 'libx264', '-preset', 'ultrafast',
-                    '-b:v', '150k', '-vf', 'scale=640:360',
+                    '-b:v', '200k', '-vf', 'scale=640:360',
                     '-c:a', 'aac', '-b:a', '64k',
                     '-shortest', final_out
                 ], capture_output=True)
@@ -221,7 +277,7 @@ def build_video():
                 return jsonify({'success': False, 'error': 'Final video failed'}), 500
 
             file_size = os.path.getsize(final_out)
-            print(f"[BUILD] Final: {file_size} bytes ✅")
+            print(f"[BUILD] ✅ Final: {file_size} bytes, duration ~{audio_duration:.1f}s")
 
             with open(final_out, 'rb') as f:
                 video_bytes = f.read()
@@ -245,7 +301,7 @@ def build_video():
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'voice': VOICE, 'captions': 'bold_white'})
+    return jsonify({'status': 'ok', 'voice': VOICE, 'captions': 'word_by_word'})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
