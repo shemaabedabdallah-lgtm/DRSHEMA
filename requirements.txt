@@ -1,3 +1,7 @@
 flask
 requests
 edge-tts
+gtts
+google-auth
+google-auth-oauthlib
+google-api-python-client
