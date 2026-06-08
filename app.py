@@ -23,8 +23,7 @@ def get_drive_service():
     try:
         creds_dict = json.loads(creds_json)
         credentials = service_account.Credentials.from_service_account_info(
-            creds_dict,
-            scopes=['https://www.googleapis.com/auth/drive.file']
+            creds_dict, scopes=['https://www.googleapis.com/auth/drive.file']
         )
         return build('drive', 'v3', credentials=credentials)
     except Exception as e:
@@ -35,7 +34,6 @@ def upload_to_drive(file_path, title, mime_type='video/mp4'):
     try:
         service = get_drive_service()
         if not service:
-            print("[DRIVE] No service account")
             return None
         ext = '.jpg' if 'image' in mime_type else '.mp4'
         file_metadata = {
@@ -53,7 +51,6 @@ def upload_to_drive(file_path, title, mime_type='video/mp4'):
         return file['id']
     except Exception as e:
         print(f"[DRIVE] Upload failed: {e}")
-        traceback.print_exc()
         return None
 
 async def generate_edge_tts_audio(text, output_path):
@@ -61,7 +58,7 @@ async def generate_edge_tts_audio(text, output_path):
     communicate = edge_tts.Communicate(text, VOICE)
     await communicate.save(output_path)
 
-def build_word_by_word_srt(script, audio_path, srt_path):
+def build_srt(script, audio_path, srt_path):
     try:
         result = subprocess.run(
             ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
@@ -92,74 +89,23 @@ def build_word_by_word_srt(script, audio_path, srt_path):
 def generate_audio(script, tmpdir):
     audio_path = os.path.join(tmpdir, 'speech.mp3')
     srt_path = os.path.join(tmpdir, 'captions.srt')
-
     try:
-        print("[TTS] Trying edge-tts...")
         asyncio.run(generate_edge_tts_audio(script, audio_path))
         if os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000:
-            print(f"[TTS] edge-tts SUCCESS: {os.path.getsize(audio_path)} bytes")
-            build_word_by_word_srt(script, audio_path, srt_path)
+            build_srt(script, audio_path, srt_path)
             return audio_path, srt_path
     except Exception as e:
-        print(f"[TTS] edge-tts FAILED: {e}")
-
+        print(f"[TTS] edge-tts failed: {e}")
     try:
-        print("[TTS] Trying gtts...")
         from gtts import gTTS
         tts = gTTS(text=script, lang='en', slow=False)
         tts.save(audio_path)
         if os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000:
-            build_word_by_word_srt(script, audio_path, srt_path)
+            build_srt(script, audio_path, srt_path)
             return audio_path, srt_path
     except Exception as e:
-        print(f"[TTS] gtts FAILED: {e}")
-
+        print(f"[TTS] gtts failed: {e}")
     return None, None
-
-def generate_thumbnail(video_path, title, output_path):
-    try:
-        frame_path = output_path + '_frame.jpg'
-        # Extract frame at 3 seconds
-        subprocess.run([
-            'ffmpeg', '-y', '-i', video_path,
-            '-ss', '3', '-vframes', '1',
-            '-vf', 'scale=1280:720',
-            frame_path
-        ], capture_output=True)
-
-        if not os.path.exists(frame_path) or os.path.getsize(frame_path) == 0:
-            subprocess.run([
-                'ffmpeg', '-y', '-i', video_path,
-                '-ss', '1', '-vframes', '1',
-                '-vf', 'scale=1280:720',
-                frame_path
-            ], capture_output=True)
-
-        if not os.path.exists(frame_path):
-            return None
-
-        # Add title overlay
-        safe_title = title[:55].replace("'", "").replace('"', '').replace(':', ' -')
-        r = subprocess.run([
-            'ffmpeg', '-y', '-i', frame_path,
-            '-vf',
-            f"drawbox=x=0:y=ih-100:w=iw:h=100:color=black@0.75:t=fill,"
-            f"drawtext=text='DR SHEMA':fontcolor=yellow:fontsize=28:x=20:y=h-85,"
-            f"drawtext=text='{safe_title}':fontcolor=white:fontsize=22:x=20:y=h-50",
-            output_path
-        ], capture_output=True)
-
-        if r.returncode != 0:
-            import shutil
-            shutil.copy(frame_path, output_path)
-
-        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-            print(f"[THUMB] ✅ {os.path.getsize(output_path)} bytes")
-            return output_path
-        return None
-    except Exception as e:
-        print(f"[THUMB] Failed: {e}")
-        return None
 
 def download_video(url, path):
     r = requests.get(url, stream=True, timeout=60)
@@ -175,15 +121,12 @@ def loop_clip(clip_path, target_duration, output_path, idx):
             capture_output=True, text=True
         )
         clip_dur = float(result.stdout.strip() or '5')
-
         if clip_dur >= target_duration:
             subprocess.run([
                 'ffmpeg', '-y', '-i', clip_path,
                 '-t', str(target_duration),
-                '-vf', 'scale=1280:720,setsar=1',
-                '-r', '30', '-an',
-                '-c:v', 'libx264', '-preset', 'fast',
-                '-b:v', '1000k', output_path
+                '-vf', 'scale=640:360,setsar=1', '-r', '25', '-an',
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-b:v', '300k', output_path
             ], capture_output=True)
         else:
             loops = int(target_duration / clip_dur) + 2
@@ -195,22 +138,47 @@ def loop_clip(clip_path, target_duration, output_path, idx):
             subprocess.run([
                 'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
                 '-i', tmp_list, '-t', str(target_duration),
-                '-vf', 'scale=1280:720,setsar=1',
-                '-r', '30', '-an',
-                '-c:v', 'libx264', '-preset', 'fast',
-                '-b:v', '1000k', looped
+                '-vf', 'scale=640:360,setsar=1', '-r', '25', '-an',
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-b:v', '300k', looped
             ], capture_output=True)
             if os.path.exists(looped):
                 os.rename(looped, output_path)
-            try:
-                os.remove(tmp_list)
-            except:
-                pass
-
+            try: os.remove(tmp_list)
+            except: pass
         return os.path.exists(output_path) and os.path.getsize(output_path) > 0
     except Exception as e:
         print(f"[CLIP {idx}] Error: {e}")
         return False
+
+def generate_thumbnail(video_path, title, output_path):
+    try:
+        frame_path = output_path + '_frame.jpg'
+        subprocess.run([
+            'ffmpeg', '-y', '-i', video_path,
+            '-ss', '3', '-vframes', '1',
+            '-vf', 'scale=640:360', frame_path
+        ], capture_output=True)
+        if not os.path.exists(frame_path) or os.path.getsize(frame_path) == 0:
+            return None
+        safe_title = title[:50].replace("'","").replace('"','').replace(':','-')
+        r = subprocess.run([
+            'ffmpeg', '-y', '-i', frame_path,
+            '-vf',
+            f"drawbox=x=0:y=ih-70:w=iw:h=70:color=black@0.7:t=fill,"
+            f"drawtext=text='DR SHEMA':fontcolor=yellow:fontsize=20:x=10:y=h-60,"
+            f"drawtext=text='{safe_title}':fontcolor=white:fontsize=14:x=10:y=h-35",
+            output_path
+        ], capture_output=True)
+        if r.returncode != 0:
+            import shutil
+            shutil.copy(frame_path, output_path)
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            print(f"[THUMB] ✅ {os.path.getsize(output_path)} bytes")
+            return output_path
+        return None
+    except Exception as e:
+        print(f"[THUMB] Failed: {e}")
+        return None
 
 @app.route('/build', methods=['POST'])
 def build_video():
@@ -222,33 +190,29 @@ def build_video():
         clip2_url = data.get('clip2_url', '')
         clip3_url = data.get('clip3_url', '')
 
-        print(f"[BUILD] Starting HD: {title[:60]}")
+        print(f"[BUILD] Starting: {title[:60]}")
 
         with tempfile.TemporaryDirectory() as tmpdir:
-
-            # Step 1: Audio + captions
+            # Audio
             audio_path, srt_path = generate_audio(script, tmpdir)
-            has_audio = audio_path and os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000
-            has_srt = srt_path and os.path.exists(srt_path) and os.path.getsize(srt_path) > 10
-
-            if not has_audio:
+            if not audio_path:
                 return jsonify({'success': False, 'error': 'TTS failed'}), 500
 
-            # Step 2: Duration — max 4 min for Direct Drive upload
+            has_srt = srt_path and os.path.exists(srt_path) and os.path.getsize(srt_path) > 10
+
+            # Duration
             result = subprocess.run(
                 ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
                  '-of', 'default=noprint_wrappers=1:nokey=1', audio_path],
                 capture_output=True, text=True
             )
-            audio_duration = float(result.stdout.strip() or '45')
-            audio_duration = min(audio_duration, 240)
+            audio_duration = min(float(result.stdout.strip() or '45'), 240)
             print(f"[BUILD] Duration: {audio_duration:.1f}s")
 
-            # Step 3: Download + loop clips in HD
+            # Clips
             clip_urls = [u for u in [clip1_url, clip2_url, clip3_url] if u]
             clip_duration = audio_duration / max(len(clip_urls), 1)
             processed = []
-
             for i, url in enumerate(clip_urls):
                 raw = os.path.join(tmpdir, f'raw{i}.mp4')
                 out = os.path.join(tmpdir, f'proc{i}.mp4')
@@ -257,79 +221,72 @@ def build_video():
                     if loop_clip(raw, clip_duration, out, i):
                         processed.append(out)
                 except Exception as e:
-                    print(f"[BUILD] Clip {i} failed: {e}")
+                    print(f"[CLIP {i}] failed: {e}")
 
             if not processed:
                 return jsonify({'success': False, 'error': 'No clips'}), 500
 
-            # Step 4: Concatenate
+            # Concat
             concat_list = os.path.join(tmpdir, 'list.txt')
             with open(concat_list, 'w') as f:
                 for p in processed:
                     f.write(f"file '{p}'\n")
-
             concat_out = os.path.join(tmpdir, 'concat.mp4')
             subprocess.run([
                 'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
                 '-i', concat_list, '-c', 'copy', concat_out
             ], capture_output=True)
 
-            # Step 5: Burn HD captions + merge audio
+            # Final with captions
             final_out = os.path.join(tmpdir, 'final.mp4')
-
             if has_srt:
                 srt_escaped = srt_path.replace('\\', '/').replace(':', '\\:')
-                vf = (f"scale=1280:720,"
-                      f"subtitles='{srt_escaped}':force_style='"
-                      f"FontName=Arial,FontSize=24,Bold=1,"
+                vf = (f"scale=640:360,subtitles='{srt_escaped}':force_style='"
+                      f"FontName=Arial,FontSize=18,Bold=1,"
                       f"PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
-                      f"Outline=3,Shadow=2,Alignment=2,MarginV=30'")
+                      f"Outline=2,Shadow=1,Alignment=2,MarginV=20'")
                 r = subprocess.run([
                     'ffmpeg', '-y', '-i', concat_out, '-i', audio_path,
                     '-map', '0:v:0', '-map', '1:a:0', '-vf', vf,
-                    '-c:v', 'libx264', '-preset', 'fast', '-b:v', '1000k',
-                    '-c:a', 'aac', '-b:a', '128k', '-shortest', final_out
-                ], capture_output=True, timeout=600)
+                    '-c:v', 'libx264', '-preset', 'fast', '-b:v', '500k',
+                    '-c:a', 'aac', '-b:a', '96k', '-shortest', final_out
+                ], capture_output=True, timeout=300)
                 if r.returncode != 0:
-                    print(f"[BUILD] Caption error: {r.stderr.decode()[-200:]}")
                     subprocess.run([
                         'ffmpeg', '-y', '-i', concat_out, '-i', audio_path,
                         '-map', '0:v:0', '-map', '1:a:0',
-                        '-c:v', 'libx264', '-preset', 'fast',
-                        '-b:v', '1000k', '-vf', 'scale=1280:720',
-                        '-c:a', 'aac', '-b:a', '128k', '-shortest', final_out
+                        '-c:v', 'libx264', '-preset', 'fast', '-b:v', '500k',
+                        '-vf', 'scale=640:360', '-c:a', 'aac', '-b:a', '96k',
+                        '-shortest', final_out
                     ], capture_output=True)
             else:
                 subprocess.run([
                     'ffmpeg', '-y', '-i', concat_out, '-i', audio_path,
                     '-map', '0:v:0', '-map', '1:a:0',
-                    '-c:v', 'libx264', '-preset', 'fast',
-                    '-b:v', '1000k', '-vf', 'scale=1280:720',
-                    '-c:a', 'aac', '-b:a', '128k', '-shortest', final_out
+                    '-c:v', 'libx264', '-preset', 'fast', '-b:v', '500k',
+                    '-vf', 'scale=640:360', '-c:a', 'aac', '-b:a', '96k',
+                    '-shortest', final_out
                 ], capture_output=True)
 
             if not os.path.exists(final_out) or os.path.getsize(final_out) == 0:
                 return jsonify({'success': False, 'error': 'Final video failed'}), 500
 
             file_size = os.path.getsize(final_out)
-            print(f"[BUILD] HD Final: {file_size} bytes ({file_size/1024/1024:.1f}MB)")
+            print(f"[BUILD] Final: {file_size/1024/1024:.1f}MB")
 
-            # Step 6: Generate thumbnail
+            # Thumbnail
             thumbnail_path = os.path.join(tmpdir, 'thumbnail.jpg')
             thumb_result = generate_thumbnail(final_out, title, thumbnail_path)
             has_thumbnail = thumb_result is not None
 
-            # Step 7: Upload directly to Google Drive
+            # Try direct Drive upload
             drive_video_id = upload_to_drive(final_out, title, 'video/mp4')
             drive_thumb_id = None
             if has_thumbnail:
                 drive_thumb_id = upload_to_drive(thumbnail_path, f"{title}_thumb", 'image/jpeg')
 
-            direct_upload = drive_video_id is not None
-
-            if direct_upload:
-                # Direct upload succeeded — no base64 needed
-                print(f"[BUILD] ✅ Direct Drive upload: video={drive_video_id} thumb={drive_thumb_id}")
+            if drive_video_id:
+                print(f"[BUILD] ✅ Direct Drive: {drive_video_id}")
                 return jsonify({
                     'success': True,
                     'has_audio': True,
@@ -345,14 +302,9 @@ def build_video():
                     'thumbnail': ''
                 })
             else:
-                # Fallback: return base64 (file may be large)
+                # Fallback base64
                 with open(final_out, 'rb') as f:
                     video_b64 = base64.b64encode(f.read()).decode('utf-8')
-                thumb_b64 = ''
-                if has_thumbnail:
-                    with open(thumbnail_path, 'rb') as f:
-                        thumb_b64 = base64.b64encode(f.read()).decode('utf-8')
-
                 return jsonify({
                     'success': True,
                     'has_audio': True,
@@ -364,7 +316,7 @@ def build_video():
                     'drive_file_id': None,
                     'direct_upload': False,
                     'video': video_b64,
-                    'thumbnail': thumb_b64
+                    'thumbnail': ''
                 })
 
     except Exception as e:
@@ -374,16 +326,7 @@ def build_video():
 @app.route('/health', methods=['GET'])
 def health():
     has_creds = bool(os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON'))
-    return jsonify({
-        'status': 'ok',
-        'voice': VOICE,
-        'quality': '1280x720 HD',
-        'bitrate': '1000k',
-        'fps': '30',
-        'captions': True,
-        'thumbnail': True,
-        'direct_drive': has_creds
-    })
+    return jsonify({'status': 'ok', 'voice': VOICE, 'quality': '640x360', 'direct_drive': has_creds})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
