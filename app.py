@@ -1,232 +1,302 @@
-#!/usr/bin/env python3
-"""
-DR SHEMA Media Empire - Video Builder Service
-- Real images from Wikipedia for each topic
-- Ken Burns cinematic zoom effect
-- Professional thumbnail with topic image
-- Doctor Shema (never DR Shema)
-- 3-5 minute videos
-- DR SHEMA watermark on every video
-"""
-
 from flask import Flask, request, jsonify
-import subprocess, os, tempfile, urllib.request, base64, json, re
+import subprocess, tempfile, os, requests, asyncio, traceback, base64, textwrap
+from PIL import Image, ImageDraw, ImageFont
+import io
 
 app = Flask(__name__)
-LOGO_PATH = "/app/logo.png"
+VOICE = "en-US-ChristopherNeural"
 
-def download_file(url, dest):
+CHANNEL_COLORS = {
+    'news':       {'bg': '#0A0A2E', 'accent': '#FF4136', 'text': '#FFFFFF'},
+    'motivation': {'bg': '#1A0A00', 'accent': '#FF8C00', 'text': '#FFFFFF'},
+    'advice':     {'bg': '#0A1A0A', 'accent': '#00C851', 'text': '#FFFFFF'},
+    'heroes':     {'bg': '#1A0A1A', 'accent': '#9B59B6', 'text': '#FFFFFF'},
+    'africa':     {'bg': '#1A0F00', 'accent': '#F39C12', 'text': '#FFFFFF'},
+    'sports':     {'bg': '#0A0A0A', 'accent': '#00B4D8', 'text': '#FFFFFF'},
+    'analysis':   {'bg': '#001A0A', 'accent': '#2ECC71', 'text': '#FFFFFF'},
+}
+
+def hex_to_rgb(h):
+    h = h.lstrip('#')
+    return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+
+def fetch_wikipedia_image(topic):
+    """Fetch the main image for a topic from Wikipedia"""
     try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=30) as r, open(dest, 'wb') as f:
-            f.write(r.read())
-        return os.path.getsize(dest) > 1000
+        # Search Wikipedia for the topic
+        search_url = "https://en.wikipedia.org/w/api.php"
+        params = {
+            'action': 'query', 'list': 'search',
+            'srsearch': topic, 'srlimit': 1, 'format': 'json'
+        }
+        r = requests.get(search_url, params=params, timeout=8)
+        results = r.json().get('query', {}).get('search', [])
+        if not results:
+            return None
+        page_title = results[0]['title']
+        # Get the page image
+        img_params = {
+            'action': 'query', 'titles': page_title,
+            'prop': 'pageimages', 'pithumbsize': 500,
+            'format': 'json'
+        }
+        r2 = requests.get(search_url, params=img_params, timeout=8)
+        pages = r2.json().get('query', {}).get('pages', {})
+        for page in pages.values():
+            thumb = page.get('thumbnail', {})
+            if thumb.get('source'):
+                return thumb['source']
     except Exception as e:
-        print(f"Download failed: {e}")
-        return False
-
-def search_wikipedia_image(topic):
-    try:
-        clean = topic.replace(' ', '_')
-        url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{clean}"
-        req = urllib.request.Request(url, headers={'User-Agent': 'DrShemaBot/1.0'})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            data = json.loads(r.read())
-            if data.get('thumbnail') and data['thumbnail'].get('source'):
-                return data['thumbnail']['source']
-    except:
-        pass
+        print(f"[WIKI] {e}")
     return None
 
-def build_video(data):
-    tmp = tempfile.mkdtemp(prefix='drshema_')
-    title = data.get('title', 'Doctor Shema News')
-    script = data.get('script', '')
-    channel = data.get('channel', 'news')
-    topic = data.get('topic', title)
-    keywords = data.get('keywords', [])
+def generate_thumbnail(title, hook, channel, topic_image_url=None, wikipedia_topic=None):
+    """Generate a professional 1280x720 thumbnail"""
+    W, H = 1280, 720
+    colors = CHANNEL_COLORS.get(channel, CHANNEL_COLORS['news'])
+    bg_color = hex_to_rgb(colors['bg'])
+    accent_color = hex_to_rgb(colors['accent'])
 
-    # Always say Doctor Shema not DR Shema
-    script = re.sub(r'\bDR\.?\s*SHEMA\b', 'Doctor Shema', script, flags=re.IGNORECASE)
-    script = re.sub(r'\bDr\.?\s*Shema\b', 'Doctor Shema', script)
+    img = Image.new('RGB', (W, H), bg_color)
+    draw = ImageDraw.Draw(img)
 
-    print(f"Building: {title}")
+    # Try to fetch topic image from Wikipedia if not provided
+    topic_img = None
+    img_url = topic_image_url
+    if not img_url and wikipedia_topic:
+        img_url = fetch_wikipedia_image(wikipedia_topic)
 
-    # Get real images from Wikipedia
-    images = []
-    all_topics = [topic] + keywords[:4]
-    for i, t in enumerate(all_topics):
-        img_url = search_wikipedia_image(t)
-        if img_url:
-            dest = os.path.join(tmp, f'img_{i}.jpg')
-            if download_file(img_url, dest):
-                images.append(dest)
-                print(f"Got image for: {t}")
-
-    # Pexels backup
-    for i, url in enumerate([data.get('clip1_url',''), data.get('clip2_url',''), data.get('clip3_url','')]):
-        if url:
-            dest = os.path.join(tmp, f'pexels_{i}.mp4')
-            if download_file(url, dest):
-                frame = os.path.join(tmp, f'frame_{i}.jpg')
-                subprocess.run(['ffmpeg','-i',dest,'-ss','00:00:02','-frames:v','1',frame,'-y'], capture_output=True, timeout=30)
-                if os.path.exists(frame):
-                    images.append(frame)
-
-    # Fallback dark background
-    if not images:
-        fb = os.path.join(tmp, 'bg.jpg')
-        subprocess.run(['ffmpeg','-f','lavfi','-i','color=c=0x0a0a1a:size=1920x1080','-frames:v','1',fb,'-y'], capture_output=True)
-        images.append(fb)
-
-    print(f"Total images: {len(images)}")
-
-    # Generate voice
-    clean_script = re.sub(r"[^\w\s.,!?-]", ' ', script)[:5000]
-    script_file = os.path.join(tmp, 'script.txt')
-    audio_wav = os.path.join(tmp, 'audio.wav')
-    audio_mp3 = os.path.join(tmp, 'audio.mp3')
-    with open(script_file, 'w') as f:
-        f.write(clean_script)
-
-    has_audio = False
-    try:
-        subprocess.run(['flite','-voice','rms','-f',script_file,'-o',audio_wav], timeout=180, check=True, capture_output=True)
-        subprocess.run(['ffmpeg','-i',audio_wav,'-codec:a','libmp3lame','-qscale:a','2',audio_mp3,'-y'], timeout=30, check=True, capture_output=True)
-        has_audio = os.path.exists(audio_mp3) and os.path.getsize(audio_mp3) > 100
-        print("Voice generated")
-    except Exception as e:
-        print(f"Voice error: {e}")
-
-    # Get audio duration
-    total_duration = 180
-    if has_audio:
+    if img_url:
         try:
-            r = subprocess.run(['ffprobe','-v','error','-show_entries','format=duration','-of','default=noprint_wrappers=1:nokey=1',audio_mp3], capture_output=True, text=True, timeout=10)
-            total_duration = float(r.stdout.strip())
-        except:
-            pass
+            r = requests.get(img_url, timeout=10)
+            topic_img = Image.open(io.BytesIO(r.content)).convert('RGB')
+            # Place image on right side
+            iw, ih = topic_img.size
+            ratio = H / ih
+            nw = int(iw * ratio)
+            topic_img = topic_img.resize((nw, H))
+            # Paste on right
+            paste_x = W - min(nw, W // 2 + 100)
+            img.paste(topic_img, (paste_x, 0))
+            # Add dark gradient overlay on left for text readability
+            for x in range(W):
+                alpha = max(0, min(255, int(255 * (1 - (x - paste_x) / (W - paste_x + 1)) * 1.5)))
+                if x < paste_x + 200:
+                    for y in range(H):
+                        try:
+                            px = img.getpixel((x, y))
+                            blended = tuple(int(bg_color[i] * (alpha/255) + px[i] * (1 - alpha/255)) for i in range(3))
+                            img.putpixel((x, y), blended)
+                        except:
+                            pass
+        except Exception as e:
+            print(f"[THUMB IMG] {e}")
 
-    dur_per_img = max(5, total_duration / len(images))
+    # Accent bar on left
+    draw.rectangle([(0, 0), (12, H)], fill=accent_color)
 
-    # Ken Burns effect per image
-    clips = []
-    for i, img in enumerate(images):
-        clip_out = os.path.join(tmp, f'clip_{i}.mp4')
-        frames = int(dur_per_img * 25)
-        if i % 2 == 0:
-            vf = f"scale=8000:-1,zoompan=z='min(zoom+0.0015,1.5)':d={frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1920x1080,setsar=1"
-        else:
-            vf = f"scale=8000:-1,zoompan=z='if(lte(zoom,1.0),1.5,max(1.001,zoom-0.0015))':d={frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1920x1080,setsar=1"
-        r = subprocess.run(['ffmpeg','-loop','1','-i',img,'-vf',vf,'-t',str(dur_per_img),'-c:v','libx264','-r','25','-pix_fmt','yuv420p',clip_out,'-y'], capture_output=True, timeout=120)
-        if os.path.exists(clip_out) and os.path.getsize(clip_out) > 1000:
-            clips.append(clip_out)
-
-    if not clips:
-        return None, None
-
-    # Concatenate
-    concat_file = os.path.join(tmp, 'concat.txt')
-    concat_out = os.path.join(tmp, 'concat.mp4')
-    with open(concat_file, 'w') as f:
-        for c in clips:
-            f.write(f"file '{c}'\n")
-    subprocess.run(['ffmpeg','-f','concat','-safe','0','-i',concat_file,'-c','copy',concat_out,'-y'], capture_output=True, timeout=120)
-
-    if not os.path.exists(concat_out):
-        return None, None
-
-    # Channel colors
-    colors = {'news':'0xFF0000','heroes':'0xFFD700','africa':'0x00AA00','motivation':'0xFF6600','advice':'0x0066FF','sports':'0xFF0000'}
-    bar_color = colors.get(channel, '0xFF0000')
-    safe_title = re.sub(r"[^a-zA-Z0-9 ]", ' ', title)[:50].strip()
-    has_logo = os.path.exists(LOGO_PATH)
-
-    output = os.path.join(tmp, 'final.mp4')
-    cmd = ['ffmpeg', '-i', concat_out]
-    if has_logo:
-        cmd += ['-i', LOGO_PATH]
-    if has_audio:
-        cmd += ['-i', audio_mp3]
-
-    if has_logo:
-        fc = (f"[0:v]scale=1920:1080,setsar=1[vb];[1:v]scale=150:150[lg];[vb][lg]overlay=W-160:10[vl];"
-              f"[vl]drawtext=text='Doctor Shema':fontsize=24:fontcolor=gold:bordercolor=black:borderw=2:x=W-155:y=165[vt];"
-              f"[vt]drawrect=x=0:y=H-60:w=W:h=60:color={bar_color}@0.9[vbar];"
-              f"[vbar]drawtext=text='{safe_title}':fontsize=28:fontcolor=white:bordercolor=black:borderw=2:x=(W-text_w)/2:y=H-46[vf]")
-    else:
-        fc = (f"[0:v]scale=1920:1080,setsar=1[vb];"
-              f"[vb]drawtext=text='Doctor Shema':fontsize=32:fontcolor=gold:bordercolor=black:borderw=3:x=20:y=20[vt];"
-              f"[vt]drawrect=x=0:y=H-60:w=W:h=60:color={bar_color}@0.9[vbar];"
-              f"[vbar]drawtext=text='{safe_title}':fontsize=28:fontcolor=white:bordercolor=black:borderw=2:x=(W-text_w)/2:y=H-46[vf]")
-
-    cmd += ['-filter_complex', fc, '-map', '[vf]']
-    if has_audio:
-        audio_idx = 2 if has_logo else 1
-        cmd += ['-map', f'{audio_idx}:a']
-    cmd += ['-c:v','libx264','-preset','fast','-c:a','aac' if has_audio else 'copy','-shortest','-r','25',output,'-y']
-
-    subprocess.run(cmd, capture_output=True, timeout=600)
-
-    if not os.path.exists(output) or os.path.getsize(output) < 10000:
-        return None, None
-
-    # Professional thumbnail with real image
-    thumb_path = os.path.join(tmp, 'thumbnail.jpg')
-    channel_labels = {'news':'BREAKING NEWS','heroes':'WORLD HEROES','africa':'AFRICA RISING','motivation':'DAILY MOTIVATION','advice':'ADVICE OF THE DAY','sports':'SPORTS NEWS'}
-    label = channel_labels.get(channel, 'DOCTOR SHEMA')
-    safe_label = label.replace("'", ' ')
-    short_title = re.sub(r"[^a-zA-Z0-9 ]", ' ', title)[:35].strip()
-
-    if images and images[0] != os.path.join(tmp, 'bg.jpg'):
-        thumb_cmd = ['ffmpeg','-i',images[0],'-vf',(
-            f"scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,"
-            f"colorchannelmixer=rr=0.4:gg=0.4:bb=0.4,"
-            f"drawrect=x=0:y=0:w=W:h=110:color={bar_color}@0.95,"
-            f"drawtext=text='{safe_label}':fontsize=52:fontcolor=white:bordercolor=black:borderw=3:x=(W-text_w)/2:y=28,"
-            f"drawrect=x=0:y=H-130:w=W:h=130:color=black@0.88,"
-            f"drawtext=text='{short_title}':fontsize=46:fontcolor=white:bordercolor=black:borderw=3:x=(W-text_w)/2:y=H-105,"
-            f"drawtext=text='Doctor Shema':fontsize=30:fontcolor=gold:bordercolor=black:borderw=2:x=(W-text_w)/2:y=H-48"
-        ),'-frames:v','1',thumb_path,'-y']
-    else:
-        thumb_cmd = ['ffmpeg','-f','lavfi','-i','color=c=0x0a0a1a:size=1280x720','-vf',(
-            f"drawrect=x=0:y=0:w=W:h=110:color={bar_color}@0.95,"
-            f"drawtext=text='{safe_label}':fontsize=52:fontcolor=white:bordercolor=black:borderw=3:x=(W-text_w)/2:y=28,"
-            f"drawtext=text='{short_title}':fontsize=54:fontcolor=white:bordercolor=black:borderw=4:x=(W-text_w)/2:y=(H-text_h)/2,"
-            f"drawrect=x=0:y=H-90:w=W:h=90:color=black@0.9,"
-            f"drawtext=text='Doctor Shema':fontsize=38:fontcolor=gold:bordercolor=black:borderw=2:x=(W-text_w)/2:y=H-65"
-        ),'-frames:v','1',thumb_path,'-y']
-
-    subprocess.run(thumb_cmd, capture_output=True, timeout=30)
-
-    with open(output,'rb') as f:
-        video_b64 = base64.b64encode(f.read()).decode()
-    thumb_b64 = ''
-    if os.path.exists(thumb_path):
-        with open(thumb_path,'rb') as f:
-            thumb_b64 = base64.b64encode(f.read()).decode()
-
-    size_mb = os.path.getsize(output)/(1024*1024)
-    print(f"Done: {size_mb:.1f}MB")
-    return video_b64, thumb_b64
-
-@app.route('/health', methods=['GET'])
-def health():
-    return jsonify({'status': 'Doctor Shema Video Service Running', 'ready': True})
-
-@app.route('/build', methods=['POST'])
-def build():
+    # Channel label top
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({'success': False, 'error': 'No data'}), 400
-        video_b64, thumb_b64 = build_video(data)
-        if video_b64:
-            return jsonify({'success': True, 'video': video_b64, 'thumbnail': thumb_b64})
-        return jsonify({'success': False, 'error': 'Build failed'}), 500
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 28)
+        font_title = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 64)
+        font_hook = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 36)
+        font_brand = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 32)
+    except:
+        font_small = ImageFont.load_default()
+        font_title = font_small
+        font_hook = font_small
+        font_brand = font_small
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 8765))
-    app.run(host='0.0.0.0', port=port)
+    # Channel badge
+    channel_label = channel.upper().replace('news', 'BREAKING NEWS').replace('motivation', 'DAILY MOTIVATION').replace('advice', 'ADVICE').replace('heroes', 'WORLD HEROES').replace('africa', 'AFRICA RISING').replace('sports', 'SPORTS').replace('analysis', 'MATCH ANALYSIS')
+    badge_w = 280
+    draw.rectangle([(30, 30), (30 + badge_w, 70)], fill=accent_color)
+    draw.text((40, 38), channel_label[:20], font=font_small, fill=(255, 255, 255))
+
+    # Main title - wrap at 22 chars per line
+    max_chars = 22
+    words = title.split()
+    lines = []
+    current = ""
+    for word in words:
+        if len(current) + len(word) + 1 <= max_chars:
+            current += (" " if current else "") + word
+        else:
+            if current:
+                lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    lines = lines[:3]
+
+    y_title = 100
+    for line in lines:
+        # Shadow
+        draw.text((34, y_title + 4), line.upper(), font=font_title, fill=(0, 0, 0))
+        draw.text((30, y_title), line.upper(), font=font_title, fill=(255, 255, 255))
+        y_title += 75
+
+    # Hook text
+    if hook:
+        hook_short = hook[:80] + ("..." if len(hook) > 80 else "")
+        hook_lines = textwrap.wrap(hook_short, width=35)[:2]
+        y_hook = y_title + 20
+        for hl in hook_lines:
+            draw.text((32, y_hook + 3), hl, font=font_hook, fill=(0, 0, 0))
+            draw.text((30, y_hook), hl, font=font_hook, fill=accent_color)
+            y_hook += 44
+
+    # Bottom brand bar
+    draw.rectangle([(0, H - 60), (W, H)], fill=accent_color)
+    draw.text((30, H - 45), "DOCTOR SHEMA  |  @drshemaaa", font=font_brand, fill=(255, 255, 255))
+
+    # Return as base64
+    buf = io.BytesIO()
+    img.save(buf, format='JPEG', quality=85)
+    return base64.b64encode(buf.getvalue()).decode()
+
+async def edge_tts(text, path):
+    import edge_tts
+    await edge_tts.Communicate(text, VOICE).save(path)
+
+def build_srt(script, audio_path, srt_path):
+    try:
+        r = subprocess.run(['ffprobe','-v','error','-show_entries','format=duration',
+            '-of','default=noprint_wrappers=1:nokey=1',audio_path],capture_output=True,text=True)
+        dur = float(r.stdout.strip() or '60')
+        words = script.split()
+        tpw = dur / max(len(words),1)
+        def fmt(t):
+            h,m,s,ms=int(t//3600),int((t%3600)//60),int(t%60),int((t%1)*1000)
+            return f"{h:02}:{m:02}:{s:02},{ms:03}"
+        with open(srt_path,'w',encoding='utf-8') as f:
+            for i in range(0,len(words),3):
+                c=words[i:i+3]; st=i*tpw; en=(i+len(c))*tpw
+                f.write(f"{i//3+1}\n{fmt(st)} --> {fmt(en)}\n{' '.join(c).upper()}\n\n")
+        return True
+    except: return False
+
+def gen_audio(script, tmpdir):
+    ap=os.path.join(tmpdir,'speech.mp3'); sp=os.path.join(tmpdir,'captions.srt')
+    try:
+        asyncio.run(edge_tts(script,ap))
+        if os.path.exists(ap) and os.path.getsize(ap)>1000:
+            build_srt(script,ap,sp); return ap,sp
+    except: pass
+    try:
+        from gtts import gTTS
+        gTTS(text=script,lang='en',slow=False).save(ap)
+        if os.path.exists(ap) and os.path.getsize(ap)>1000:
+            build_srt(script,ap,sp); return ap,sp
+    except: pass
+    return None,None
+
+def dl(url,path):
+    r=requests.get(url,stream=True,timeout=60)
+    with open(path,'wb') as f:
+        for c in r.iter_content(8192): f.write(c)
+
+def loop_clip(src,dur,out,idx):
+    try:
+        r=subprocess.run(['ffprobe','-v','error','-show_entries','format=duration',
+            '-of','default=noprint_wrappers=1:nokey=1',src],capture_output=True,text=True)
+        cd=float(r.stdout.strip() or '5')
+        if cd>=dur:
+            subprocess.run(['ffmpeg','-y','-i',src,'-t',str(dur),
+                '-vf','scale=320:180,setsar=1','-r','20','-an',
+                '-c:v','libx264','-preset','ultrafast','-b:v','100k',out],capture_output=True)
+        else:
+            lst=out+'_l.txt'
+            with open(lst,'w') as f:
+                for _ in range(int(dur/cd)+2): f.write(f"file '{src}'\n")
+            lp=out+'_lp.mp4'
+            subprocess.run(['ffmpeg','-y','-f','concat','-safe','0','-i',lst,'-t',str(dur),
+                '-vf','scale=320:180,setsar=1','-r','20','-an',
+                '-c:v','libx264','-preset','ultrafast','-b:v','100k',lp],capture_output=True)
+            if os.path.exists(lp): os.rename(lp,out)
+            try: os.remove(lst)
+            except: pass
+        return os.path.exists(out) and os.path.getsize(out)>0
+    except Exception as e:
+        print(f"[CLIP] {e}"); return False
+
+@app.route('/build',methods=['POST'])
+def build_video():
+    try:
+        data=request.get_json()
+        script=data.get('script',''); title=data.get('title','video')
+        c1=data.get('clip1_url',''); c2=data.get('clip2_url',''); c3=data.get('clip3_url','')
+        channel=data.get('channel','news')
+        hook=data.get('hook','')
+        wikipedia_topic=data.get('wikipedia_topic','')
+        print(f"[BUILD] {title[:50]}")
+
+        # Generate thumbnail (non-blocking, runs fast)
+        thumb_b64 = None
+        try:
+            thumb_b64 = generate_thumbnail(title, hook, channel, wikipedia_topic=wikipedia_topic)
+            print(f"[THUMB] Generated OK")
+        except Exception as te:
+            print(f"[THUMB] Failed: {te}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ap,sp=gen_audio(script,tmp)
+            if not ap: return jsonify({'success':False,'error':'TTS failed'}),500
+            has_srt=sp and os.path.exists(sp) and os.path.getsize(sp)>10
+            r=subprocess.run(['ffprobe','-v','error','-show_entries','format=duration',
+                '-of','default=noprint_wrappers=1:nokey=1',ap],capture_output=True,text=True)
+            dur=min(float(r.stdout.strip() or '45'),240)
+            urls=[u for u in [c1,c2,c3] if u]
+            cdur=dur/max(len(urls),1); procs=[]
+            for i,u in enumerate(urls):
+                raw=os.path.join(tmp,f'r{i}.mp4'); out=os.path.join(tmp,f'p{i}.mp4')
+                try:
+                    dl(u,raw)
+                    if loop_clip(raw,cdur,out,i): procs.append(out)
+                except Exception as e: print(f"[CLIP {i}] {e}")
+            if not procs: return jsonify({'success':False,'error':'No clips'}),500
+            lst=os.path.join(tmp,'l.txt')
+            with open(lst,'w') as f:
+                for p in procs: f.write(f"file '{p}'\n")
+            cat=os.path.join(tmp,'cat.mp4')
+            subprocess.run(['ffmpeg','-y','-f','concat','-safe','0','-i',lst,'-c','copy',cat],capture_output=True)
+            fin=os.path.join(tmp,'final.mp4')
+            if has_srt:
+                se=sp.replace('\\','/').replace(':','\\:')
+                vf=(f"scale=320:180,subtitles='{se}':force_style='"
+                    f"FontName=Arial,FontSize=14,Bold=1,PrimaryColour=&H00FFFFFF,"
+                    f"OutlineColour=&H00000000,Outline=2,Alignment=2,MarginV=10'")
+                r2=subprocess.run(['ffmpeg','-y','-i',cat,'-i',ap,
+                    '-map','0:v:0','-map','1:a:0','-vf',vf,
+                    '-c:v','libx264','-preset','ultrafast','-b:v','120k',
+                    '-c:a','aac','-b:a','48k','-shortest',fin],capture_output=True,timeout=300)
+                if r2.returncode!=0:
+                    subprocess.run(['ffmpeg','-y','-i',cat,'-i',ap,
+                        '-map','0:v:0','-map','1:a:0','-vf','scale=320:180',
+                        '-c:v','libx264','-preset','ultrafast','-b:v','100k',
+                        '-c:a','aac','-b:a','48k','-shortest',fin],capture_output=True)
+            else:
+                subprocess.run(['ffmpeg','-y','-i',cat,'-i',ap,
+                    '-map','0:v:0','-map','1:a:0','-vf','scale=320:180',
+                    '-c:v','libx264','-preset','ultrafast','-b:v','100k',
+                    '-c:a','aac','-b:a','48k','-shortest',fin],capture_output=True)
+            if not os.path.exists(fin) or os.path.getsize(fin)==0:
+                return jsonify({'success':False,'error':'Final failed'}),500
+            sz=os.path.getsize(fin)
+            print(f"[BUILD] {sz/1024/1024:.1f}MB")
+            with open(fin,'rb') as f: vb64=base64.b64encode(f.read()).decode()
+            return jsonify({'success':True,'has_audio':True,'has_captions':has_srt,
+                'has_thumbnail': thumb_b64 is not None,
+                'thumbnail': thumb_b64,
+                'file_size':sz,'duration':round(dur,1),
+                'title':title,'video':vb64})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'success':False,'error':str(e)}),500
+
+@app.route('/health',methods=['GET'])
+def health():
+    return jsonify({'status':'ok','voice':VOICE,'quality':'320x180','thumbnail':'enabled'})
+
+if __name__=='__main__':
+    app.run(host='0.0.0.0',port=int(os.environ.get('PORT',5000)))
