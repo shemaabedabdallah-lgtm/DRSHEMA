@@ -4,7 +4,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance
 import io, math
 
 app = Flask(__name__)
-VOICE = "en-US-ChristopherNeural"
+VOICE = "en-KE-ChilembaNeural"
 
 CHANNEL_COLORS = {
     'news':       {'bg': '#0A0A2E', 'accent': '#FF4136', 'text': '#FFFFFF'},
