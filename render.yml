@@ -1,8 +1,0 @@
-services:
-  - type: web
-    name: DRSHEMA
-    runtime: docker
-    plan: standard
-    envVars:
-      - key: PORT
-        value: 10000
